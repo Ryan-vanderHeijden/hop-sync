@@ -138,6 +138,12 @@ class FakeSFTP:
         add(b"..", stat.S_IFDIR | 0o755)
         return entries
 
+    async def rename(self, old, new):
+        # Like OpenSSH's plain rename: refuses to replace an existing target.
+        if new in self.files:
+            raise asyncssh.SFTPFailure("Failure")
+        self.files[new] = self.files.pop(old)
+
     async def posix_rename(self, old, new):
         self.files[new] = self.files.pop(old)
 

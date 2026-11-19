@@ -11,8 +11,8 @@ import pytest
 from fakes import FakeFile, FakeSFTP, endpoints
 
 from hopsync.core import resume
-from hopsync.core.errors import VerificationFailed
-from hopsync.core.events import TransferFinished, TransferProgress, TransferStarted, Verifying
+from hopsync.core.errors import ConflictError, VerificationFailed
+from hopsync.core.events import TransferFinished, TransferProgress, EntrySkipped, TransferStarted, Verifying
 from hopsync.core.transfer import TransferError, copy_file, resolve_destination
 
 
@@ -140,3 +140,41 @@ async def test_resolve_new_name():
 async def test_resolve_missing_parent():
     with pytest.raises(TransferError, match="does not exist"):
         await resolve_destination(FakeSFTP(), "/x/f", "nodir/new.bin")
+
+
+async def test_existing_different_destination_is_refused_untouched():
+    src, dst = endpoints({"a": FakeFile(b"new")}, {"b": FakeFile(b"precious")})
+    with pytest.raises(ConflictError, match="exists and differs"):
+        await copy_file(src, "a", dst, "b", lambda e: None)
+    assert bytes(dst.sftp.files["b"].data) == b"precious"
+    assert set(dst.sftp.files) == {"b"}  # no .part, no sidecar
+
+
+async def test_existing_identical_destination_is_already_copied():
+    src, dst = endpoints({"a": FakeFile(b"same", mtime=5)}, {"b": FakeFile(b"same", mtime=5)})
+    events = []
+    await copy_file(src, "a", dst, "b", events.append)
+    assert [e.reason for e in events if isinstance(e, EntrySkipped)] == ["already copied"]
+    assert not any(isinstance(e, TransferStarted) for e in events)
+    assert set(dst.sftp.files) == {"b"}
+
+
+async def test_overwrite_replaces_existing_destination():
+    src, dst = endpoints({"a": FakeFile(b"new data")}, {"b": FakeFile(b"old")})
+    await copy_file(src, "a", dst, "b", lambda e: None, overwrite=True)
+    assert bytes(dst.sftp.files["b"].data) == b"new data"
+
+
+async def test_target_appearing_during_copy_is_not_overwritten():
+    src, dst = endpoints({"a": FakeFile(b"new data")})
+    real_rename = dst.sftp.rename
+
+    async def sneaky_rename(old, new):
+        dst.sftp.files[new] = FakeFile(b"someone else")  # appears just before the rename
+        await real_rename(old, new)
+
+    dst.sftp.rename = sneaky_rename
+    with pytest.raises(ConflictError):
+        await copy_file(src, "a", dst, "b", lambda e: None)
+    assert bytes(dst.sftp.files["b"].data) == b"someone else"
+    assert set(dst.sftp.files) == {"b"}  # part and sidecar removed

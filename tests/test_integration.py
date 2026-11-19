@@ -1,14 +1,17 @@
 """Tests against the docker hosts (see conftest.py)."""
 
+import asyncio
 import hashlib
 import os
 from contextlib import asynccontextmanager
 
+import asyncssh
 import pytest
 
 from hopsync.core.listing import list_dir
 from hopsync.core.events import TransferProgress, TransferStarted
-from hopsync.core.errors import VerificationFailed
+from hopsync.cli import main
+from hopsync.core.errors import ConflictError, VerificationFailed
 from hopsync.core.session import AuthFailed, ConnectError, Endpoint, HostKeyError, connect
 from hopsync.core.transfer import copy_file, resolve_destination
 
@@ -194,10 +197,57 @@ async def test_corrupted_part_fails_verification(hosts):
         assert not await exists(dst.conn, "bad.bin")
 
 
-async def test_overwrite_existing_destination(hosts):
+async def test_plain_rename_refuses_to_replace_on_this_sshd(hosts):
+    """The no-overwrite default depends on this OpenSSH behaviour."""
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(dst.conn, "ren-a.txt", b"a")
+        await put_file(dst.conn, "ren-b.txt", b"b")
+        with pytest.raises(asyncssh.SFTPError):
+            await dst.sftp.rename("ren-a.txt", "ren-b.txt")
+        assert (await dst.conn.run("cat ren-b.txt", check=True)).stdout == "b"
+
+
+async def cli_copy(hosts, monkeypatch, *args):
+    """Run `hopsync copy ...` in-process; returns the exit code."""
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": hosts.password)
+    argv = ["--config", str(hosts.config), "--password-for", "hpc", "copy", *args]
+    return await asyncio.to_thread(main, argv)
+
+
+async def test_existing_different_file_is_refused(hosts, monkeypatch, capsys):
+    mine = b"precious data"
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(dst.conn, "refuse.bin", mine)
+        await put_file(src.conn, "refuse.bin", os.urandom(5000))
+        with pytest.raises(ConflictError):
+            await copy_file(src, "refuse.bin", dst, "refuse.bin", lambda e: None)
+        assert await sha256_remote(dst.conn, "refuse.bin") == hashlib.sha256(mine).hexdigest()
+        assert not await exists(dst.conn, "refuse.bin.hopsync-part")
+        assert not await exists(dst.conn, "refuse.bin.hopsync-part.json")
+        code = await cli_copy(hosts, monkeypatch, "hpc:refuse.bin", "server:refuse.bin")
+        assert code == 1
+        assert "exists and differs" in capsys.readouterr().err
+        assert await sha256_remote(dst.conn, "refuse.bin") == hashlib.sha256(mine).hexdigest()
+
+
+async def test_identical_file_is_already_copied(hosts, monkeypatch, capsys):
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "same.bin", b"same bytes")
+        await src.conn.run("touch -d '2020-01-02 03:04:05' same.bin", check=True)
+    assert await cli_copy(hosts, monkeypatch, "hpc:same.bin", "server:same.bin") == 0  # first copy
+    capsys.readouterr()
+    assert await cli_copy(hosts, monkeypatch, "hpc:same.bin", "server:same.bin") == 0
+    assert "already copied" in capsys.readouterr().out
+
+
+async def test_overwrite_flag_replaces_existing_destination(hosts, monkeypatch):
     new_data = os.urandom(2_000_000)
     async with hpc_to_server(hosts) as (src, dst):
         await put_file(dst.conn, "over.bin", b"old contents")
         await put_file(src.conn, "over.bin", new_data)
-        await copy_file(src, "over.bin", dst, "over.bin", lambda e: None)
+        await copy_file(src, "over.bin", dst, "over.bin", lambda e: None, overwrite=True)
         assert await sha256_remote(dst.conn, "over.bin") == hashlib.sha256(new_data).hexdigest()
+        await put_file(dst.conn, "over2.bin", b"old contents")
+        await src.conn.run("cp over.bin over2.bin", check=True)
+        assert await cli_copy(hosts, monkeypatch, "--overwrite", "hpc:over2.bin", "server:over2.bin") == 0
+        assert await sha256_remote(dst.conn, "over2.bin") == hashlib.sha256(new_data).hexdigest()

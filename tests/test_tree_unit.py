@@ -117,11 +117,27 @@ async def test_links_flag_copies_symlinks():
     src, dst = make_endpoints()
     add_file(src.sftp, "/src/ok.txt", b"ok")
     src.sftp.links["/src/link"] = "ok.txt"
-    dst.sftp.links["/dst/src/link"] = "stale-target"
-    dst.sftp.dirs.add("/dst/src")
-    # an old link at the path is replaced
     await copy_tree(src, "/src", dst, "/dst/src", lambda e: None, links=True)
     assert dst.sftp.links["/dst/src/link"] == "ok.txt"
+
+
+async def test_existing_links_same_target_skipped_other_refused_or_replaced():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/ok.txt", b"ok")
+    src.sftp.links["/src/same"] = "ok.txt"
+    src.sftp.links["/src/other"] = "ok.txt"
+    dst.sftp.dirs.add("/dst/src")
+    dst.sftp.links["/dst/src/same"] = "ok.txt"
+    dst.sftp.links["/dst/src/other"] = "different"
+    events = []
+    result = await copy_tree(src, "/src", dst, "/dst/src", events.append, links=True)
+    assert [e.path for e in events if isinstance(e, EntrySkipped) and e.reason == "already copied"] == ["/src/same"]
+    assert [path for path, _ in result.failures] == ["/src/other"]
+    assert dst.sftp.links["/dst/src/other"] == "different"  # untouched
+
+    result = await copy_tree(src, "/src", dst, "/dst/src", lambda e: None, links=True, overwrite=True)
+    assert result.failed == 0
+    assert dst.sftp.links["/dst/src/other"] == "ok.txt"
 
 
 async def test_skip_if_identical_and_copy_if_different():
@@ -131,7 +147,7 @@ async def test_skip_if_identical_and_copy_if_different():
     add_file(dst.sftp, "/dst/src/same.txt", b"abc", mtime=50)  # identical
     add_file(dst.sftp, "/dst/src/newer.txt", b"abc", mtime=10)  # same size, other mtime
     events = []
-    result = await copy_tree(src, "/src", dst, "/dst/src", events.append)
+    result = await copy_tree(src, "/src", dst, "/dst/src", events.append, overwrite=True)
 
     skipped = [e.path for e in events if isinstance(e, EntrySkipped) and e.reason == "already copied"]
     assert skipped == ["/src/same.txt"]
@@ -201,12 +217,48 @@ async def test_directory_metadata_connection_loss_is_fatal():
         await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
 
 
-async def test_existing_read_only_destination_dir_is_made_writable():
+async def test_existing_read_only_destination_dir_is_restored_to_original_mode():
     src, dst = make_endpoints()
     add_file(src.sftp, "/src/ro/a.txt", b"new", mtime=70)
-    src.sftp.dir_meta["/src/ro"] = [0o555, 5]
+    src.sftp.dir_meta["/src/ro"] = [0o755, 9]
     dst.sftp.dirs.update({"/dst/src", "/dst/src/ro"})
-    dst.sftp.dir_meta["/dst/src/ro"] = [0o555, 5]  # left read-only by an earlier run
+    dst.sftp.dir_meta["/dst/src/ro"] = [0o555, 5]  # existing, read-only, not made by us
     await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
     assert bytes(dst.sftp.files["/dst/src/ro/a.txt"].data) == b"new"
     assert dst.sftp.dir_meta["/dst/src/ro"] == [0o555, 5]  # original mode restored
+
+
+async def test_conflicting_file_is_refused_without_overwrite():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"new")
+    add_file(dst.sftp, "/dst/src/a.txt", b"old", mtime=1)
+    result = await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert (result.copied, result.failed) == (0, 1)
+    assert result.failures == [("/src/a.txt", "exists and differs; not overwriting (use --overwrite to replace)")]
+    assert bytes(dst.sftp.files["/dst/src/a.txt"].data) == b"old"
+    assert set(dst.sftp.files) == {"/dst/src/a.txt"}  # no .part or sidecar
+
+
+async def test_existing_directories_keep_their_metadata_unless_overwrite():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/sub/new.txt", b"n")
+    src.sftp.dir_meta.update({"/src": [0o700, 900], "/src/sub": [0o700, 900]})
+    dst.sftp.dirs.update({"/dst/src", "/dst/src/sub"})
+    dst.sftp.dir_meta.update({"/dst/src": [0o750, 10], "/dst/src/sub": [0o750, 10]})
+
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert dst.sftp.dir_meta["/dst/src"] == [0o750, 10]  # untouched
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o750, 10]
+
+    dst.sftp.files.clear()
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None, overwrite=True)
+    assert dst.sftp.dir_meta["/dst/src"] == [0o700, 900]  # source metadata applied
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o700, 900]
+
+
+async def test_created_directories_get_source_metadata_without_overwrite():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/sub/new.txt", b"n")
+    src.sftp.dir_meta["/src/sub"] = [0o700, 900]
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o700, 900]

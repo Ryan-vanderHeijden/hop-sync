@@ -53,6 +53,8 @@ class ProgressBar:
             self.resumed_from = event.resumed_from
             if event.resumed_from:
                 print(f"resuming from {human_size(event.resumed_from)}", file=sys.stderr)
+        elif isinstance(event, EntrySkipped):
+            print(f"{event.path}: {event.reason}")
         elif isinstance(event, Verifying):
             self.clear()
             print(f"verifying ({event.method})...", file=sys.stderr)
@@ -227,9 +229,10 @@ async def copy_single_file(args, src_end, src_path, dst_end, dst_path) -> int:
         if isinstance(event, TransferFinished):
             finished.append(event)
 
-    await copy_file(src_end, src_path, dst_end, dst_path, on_event, verify=args.verify)
+    await copy_file(src_end, src_path, dst_end, dst_path, on_event, verify=args.verify, overwrite=args.overwrite)
     bar.clear()
-    print_summary(finished[0], bar.resumed_from)
+    if finished:
+        print_summary(finished[0], bar.resumed_from)
     return 0
 
 
@@ -237,7 +240,7 @@ async def copy_directory(args, src_end, src_path, dst_end, dst_path) -> int:
     bar = TreeBar()
     started = time.monotonic()
     result = await copy_tree(
-        src_end, src_path, dst_end, dst_path, bar, links=args.links, verify=args.verify
+        src_end, src_path, dst_end, dst_path, bar, links=args.links, verify=args.verify, overwrite=args.overwrite
     )
     bar.clear()
     print_tree_summary(result, time.monotonic() - started)
@@ -258,6 +261,9 @@ def build_parser() -> argparse.ArgumentParser:
     copy_cmd.add_argument("src", metavar="SRC_ALIAS:PATH")
     copy_cmd.add_argument("dst", metavar="DST_ALIAS:PATH")
     copy_cmd.add_argument("--links", action="store_true", help="copy symlinks as links (directories only)")
+    copy_cmd.add_argument(
+        "--overwrite", action="store_true", help="replace existing destination files that differ"
+    )
     copy_cmd.add_argument("--verify", action="store_true", help="also compare sha256 checksums")
     return parser
 

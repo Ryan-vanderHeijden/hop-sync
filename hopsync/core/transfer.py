@@ -10,8 +10,8 @@ from collections.abc import Callable
 import asyncssh
 
 from . import resume
-from .errors import TransferError, VerificationFailed
-from .events import TransferFinished, TransferProgress, TransferStarted, Verifying
+from .errors import ConflictError, TransferError, VerificationFailed
+from .events import EntrySkipped, TransferFinished, TransferProgress, TransferStarted, Verifying
 from .session import Endpoint
 from .verify import remote_sha256
 
@@ -39,6 +39,25 @@ async def resolve_destination(dst_sftp, src_path: str, dst_path: str) -> str:
     if parent_attrs is None or not stat.S_ISDIR(parent_attrs.permissions or 0):
         raise TransferError(f"destination directory '{parent}' does not exist")
     return dst_path
+
+
+async def check_destination(sftp, path: str, size: int, mtime: int, overwrite: bool) -> bool:
+    """Look at the destination BEFORE writing anything. The one place for this rule.
+
+    Returns True if the file is already there (same size and mtime), so
+    there is nothing to do. Returns False if the path is free, or if it
+    holds something different and overwrite is allowed. Raises
+    ConflictError if it holds something different and overwrite is off.
+    """
+    attrs = await stat_or_none(sftp, path)
+    if attrs is None:
+        return False
+    is_regular = stat.S_ISREG(attrs.permissions or 0)
+    if is_regular and attrs.size == size and attrs.mtime == mtime:
+        return True
+    if overwrite:
+        return False
+    raise ConflictError(path)
 
 
 async def apply_metadata(sftp, path: str, mode: int, mtime: int) -> None:
@@ -134,16 +153,34 @@ async def _verify(src, src_path, dst, dst_path, total, offset, verify, hasher, o
         raise VerificationFailed("checksum mismatch between source and destination")
 
 
-async def _finish(dst: Endpoint, dst_path: str) -> None:
+async def _finish(dst: Endpoint, dst_path: str, overwrite: bool) -> None:
     """Move the verified .part into place and drop the sidecar."""
     part = resume.part_path(dst_path)
-    try:
-        # posix_rename is atomic and overwrites an existing file.
-        await dst.sftp.posix_rename(part, dst_path)
-    except asyncssh.SFTPOpUnsupported:
-        await resume.remove_quietly(dst.sftp, dst_path)
-        await dst.sftp.rename(part, dst_path)
+    if overwrite:
+        try:
+            # posix_rename is atomic and replaces an existing file.
+            await dst.sftp.posix_rename(part, dst_path)
+        except asyncssh.SFTPOpUnsupported:
+            await resume.remove_quietly(dst.sftp, dst_path)
+            await dst.sftp.rename(part, dst_path)
+    else:
+        await _rename_without_replacing(dst, part, dst_path)
     await resume.remove_quietly(dst.sftp, resume.meta_path(dst_path))
+
+
+async def _rename_without_replacing(dst: Endpoint, part: str, dst_path: str) -> None:
+    """Plain SFTP rename: OpenSSH refuses to replace an existing target.
+
+    That makes it atomic, so a file that appeared on the destination while
+    we were copying is never overwritten.
+    """
+    try:
+        await dst.sftp.rename(part, dst_path)
+    except asyncssh.SFTPError:
+        if await stat_or_none(dst.sftp, dst_path) is None:
+            raise  # some other problem
+        await _discard_partial(dst, dst_path)
+        raise ConflictError(dst_path) from None
 
 
 async def copy_file(
@@ -154,6 +191,7 @@ async def copy_file(
     on_event: Callable,
     *,
     verify: bool = False,
+    overwrite: bool = False,
     chunk_size: int = 4 * 1024 * 1024,
     queue_depth: int = 4,
 ) -> int:
@@ -168,6 +206,11 @@ async def copy_file(
     if not stat.S_ISREG(src_attrs.permissions or 0):
         raise TransferError(f"'{src_path}' is not a regular file")
     total = src_attrs.size or 0
+
+    # Decide about an existing destination before creating anything there.
+    if await check_destination(dst.sftp, dst_path, total, src_attrs.mtime or 0, overwrite):
+        on_event(EntrySkipped(src_path, "already copied"))
+        return total
 
     # Open the source FIRST: if it cannot be read (e.g. permission denied),
     # we fail before anything has been written on the destination.
@@ -195,7 +238,7 @@ async def copy_file(
         await _discard_partial(dst, dst_path)
         raise VerificationFailed(f"{error}; partial file removed, rerun to copy again") from None
 
-    await _finish(dst, dst_path)
+    await _finish(dst, dst_path, overwrite)
     await apply_metadata(dst.sftp, dst_path, src_attrs.permissions or 0o644, src_attrs.mtime or 0)
     on_event(TransferFinished(src_path, dst_path, total, time.monotonic() - started))
     return total

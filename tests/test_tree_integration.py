@@ -8,7 +8,7 @@ from hopsync.cli import main
 from hopsync.core.events import EntryFailed, EntrySkipped, TransferStarted, TreeProgress
 from hopsync.core.transfer import copy_file, resolve_destination
 from hopsync.core.tree import copy_tree
-from test_integration import hpc_to_server
+from test_integration import cli_copy, hpc_to_server
 
 pytestmark = pytest.mark.integration
 
@@ -180,7 +180,7 @@ async def test_single_file_copy_preserves_mtime_and_mode(hosts):
         assert (await run(dst.conn, "stat -c '%a %Y' t10.txt")).strip() == "640 1577934245"
 
 
-async def test_read_only_source_directory_and_rerun(hosts):
+async def test_read_only_source_directory_and_rerun(hosts, monkeypatch):
     async with hpc_to_server(hosts) as (src, dst):
         await run(src.conn, """
             chmod -R u+w t11 2>/dev/null; rm -rf t11 && mkdir -p t11/ro &&
@@ -188,19 +188,95 @@ async def test_read_only_source_directory_and_rerun(hosts):
             touch -d '2020-01-01 00:00:00' t11/ro/a.txt t11/ro/b.txt &&
             chmod g-s t11 t11/ro && chmod 555 t11/ro
         """)
-    # First copy works even though the directory is read-only (children go first).
-    first, _ = await copy_to(hosts, "t11", "t11copy")
-    assert (first.copied, first.failed) == (2, 0)
-    async with hpc_to_server(hosts) as (src, dst):
-        assert (await run(dst.conn, "stat -c %a t11copy/ro")).strip() == "555"
+        await run(dst.conn, "chmod -R u+w t11holder 2>/dev/null; rm -rf t11holder && mkdir t11holder")
+
+        # First copy works even though the directory is read-only (children go
+        # first), and the directories hopsync created get the source's modes.
+        assert await cli_copy(hosts, monkeypatch, "hpc:t11", "server:t11holder") == 0
+        assert (await run(dst.conn, "stat -c %a t11holder/t11/ro")).strip() == "555"
+
         # Change one source file (needs the directory writable for a moment).
         await run(src.conn, """
             chmod u+w t11/ro && echo changed-content > t11/ro/a.txt &&
             touch -d '2021-01-01 00:00:00' t11/ro/a.txt && chmod 555 t11/ro
         """)
-    second, events = await copy_to(hosts, "t11", "t11copy")
-    assert (second.copied, second.skipped, second.failed) == (1, 1, 0)
-    assert [e.path for e in events if isinstance(e, EntrySkipped)] == ["t11/ro/b.txt"]
+        # Rerun without --overwrite: the changed file is refused, exit code 1.
+        assert await cli_copy(hosts, monkeypatch, "hpc:t11", "server:t11holder") == 1
+        assert (await run(dst.conn, "cat t11holder/t11/ro/a.txt")).strip() == "one"
+        assert (await run(dst.conn, "stat -c %a t11holder/t11/ro")).strip() == "555"
+
+        # With --overwrite it is replaced, and the directory mode ends correct.
+        assert await cli_copy(hosts, monkeypatch, "--overwrite", "hpc:t11", "server:t11holder") == 0
+        assert (await run(dst.conn, "cat t11holder/t11/ro/a.txt")).strip() == "changed-content"
+        assert (await run(dst.conn, "stat -c %a t11holder/t11/ro")).strip() == "555"
+
+
+STAT = "stat -c '%a %Y'"
+
+
+async def build_existing_destination(conn):
+    """server:t12holder/t12 already holds data hopsync must not disturb."""
+    await run(conn, """
+        chmod -R u+w t12holder 2>/dev/null; rm -rf t12holder &&
+        mkdir -p t12holder/t12/keep t12holder/t12/grow &&
+        echo "old different" > t12holder/t12/a.txt && echo unrelated > t12holder/t12/unrelated.txt &&
+        echo k > t12holder/t12/keep/k.txt && touch -d '2020-01-01 00:00:00' t12holder/t12/keep/k.txt &&
+        chmod g-s t12holder/t12 t12holder/t12/keep t12holder/t12/grow &&
+        chmod 750 t12holder/t12/keep t12holder/t12/grow &&
+        touch -d '2015-01-01 00:00:00' t12holder/t12/keep t12holder/t12/grow
+    """)
+
+
+async def build_source_for_existing(conn):
+    await run(conn, """
+        rm -rf t12 && mkdir -p t12/keep t12/grow &&
+        echo "new content of a" > t12/a.txt && echo fresh > t12/new.txt &&
+        echo k > t12/keep/k.txt && touch -d '2020-01-01 00:00:00' t12/keep/k.txt &&
+        echo grown > t12/grow/g.txt &&
+        chmod g-s t12 t12/keep t12/grow && chmod 700 t12/keep t12/grow &&
+        touch -d '2010-01-01 00:00:00' t12/keep t12/grow t12
+    """)
+
+
+async def test_copy_into_existing_tree_never_modifies_existing_data(hosts, monkeypatch, capsys):
     async with hpc_to_server(hosts) as (src, dst):
-        assert (await run(dst.conn, "cat t11copy/ro/a.txt")).strip() == "changed-content"
-        assert (await run(dst.conn, "stat -c %a t11copy/ro")).strip() == "555"
+        await build_source_for_existing(src.conn)
+        await build_existing_destination(dst.conn)
+        keep_before = await run(dst.conn, f"{STAT} t12holder/t12/keep")
+        root_before = await run(dst.conn, f"{STAT} t12holder/t12")
+        a_before = await run(dst.conn, "sha256sum t12holder/t12/a.txt")
+
+        code = await cli_copy(hosts, monkeypatch, "hpc:t12", "server:t12holder")
+        err = capsys.readouterr().err
+        assert code == 1
+        assert "t12/a.txt" in err and "exists and differs" in err
+
+        assert await run(dst.conn, "sha256sum t12holder/t12/a.txt") == a_before  # (a) untouched
+        assert (await run(dst.conn, "cat t12holder/t12/unrelated.txt")).strip() == "unrelated"  # (b)
+        assert await run(dst.conn, f"{STAT} t12holder/t12/keep") == keep_before  # (c) mode and mtime
+        assert (await run(dst.conn, f"{STAT} t12holder/t12/grow")).split()[0] == "750"  # (d) mode
+        assert (await run(dst.conn, f"{STAT} t12holder/t12")).split()[0] == root_before.split()[0]
+        assert (await run(dst.conn, "cat t12holder/t12/grow/g.txt")).strip() == "grown"
+        assert (await run(dst.conn, "cat t12holder/t12/new.txt")).strip() == "fresh"
+
+        # Same tree with --overwrite: (a) is replaced and directory metadata applied.
+        code = await cli_copy(hosts, monkeypatch, "--overwrite", "hpc:t12", "server:t12holder")
+        assert code == 0
+        assert (await run(dst.conn, "cat t12holder/t12/a.txt")).strip() == "new content of a"
+        assert (await run(dst.conn, f"{STAT} t12holder/t12/keep")).split()[0] == "700"
+        assert (await run(dst.conn, "stat -c %Y t12holder/t12/keep")).strip() == (
+            await run(src.conn, "stat -c %Y t12/keep")
+        ).strip()
+
+
+async def test_existing_read_only_destination_directory_ends_up_unchanged(hosts, monkeypatch):
+    async with hpc_to_server(hosts) as (src, dst):
+        await run(src.conn, "rm -rf t13 && mkdir -p t13/ro && echo added > t13/ro/new.txt && chmod g-s t13/ro")
+        await run(dst.conn, """
+            chmod -R u+w t13holder 2>/dev/null; rm -rf t13holder && mkdir -p t13holder/t13/ro &&
+            chmod g-s t13holder/t13/ro && chmod 555 t13holder/t13/ro
+        """)
+        code = await cli_copy(hosts, monkeypatch, "hpc:t13", "server:t13holder")
+        assert code == 0
+        assert (await run(dst.conn, "cat t13holder/t13/ro/new.txt")).strip() == "added"
+        assert (await run(dst.conn, "stat -c %a t13holder/t13/ro")).strip() == "555"  # as found

@@ -45,6 +45,7 @@ Key rule: `core` emits progress as events (callback or asyncio queue). The CLI, 
 - Memory budget: queue depth 4 × chunk size 4 MB = at most 16 MB buffered per job.
 - Throughput: confirm asyncssh keeps several SFTP requests in flight per read/write (`block_size` / `max_requests`). Sequential single requests are limited by network latency. Measure throughput and record it.
 - Destination path rules work like `cp`: if the destination is an existing directory, copy into it under the source name; otherwise the destination is the new file name. The parent directory must exist.
+- Never change existing destination data by default. An existing destination file that differs (by size or mtime) is refused with a clear error and left untouched; identical files are skipped as "already copied"; `--overwrite` allows replacement. Existing destination directories keep their mode and mtime (hopsync only sets metadata on directories it created). Milestone 6's conflict dialog later replaces the hard refusal.
 - Copying between two paths on the same host is refused with a clear error. Relaying through this computer would be pointless.
 - Acceptance: a generated 1 GB file copies with correct size, and process RSS grows by less than 50 MB over its pre-copy baseline (buffer budget is 16 MB).
 

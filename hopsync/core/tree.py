@@ -9,10 +9,10 @@ from dataclasses import dataclass, field
 import asyncssh
 
 from . import resume
-from .errors import TransferError
+from .errors import ConflictError, TransferError
 from .events import EntryFailed, EntrySkipped, TreeProgress
 from .session import Endpoint
-from .transfer import apply_metadata, copy_file, stat_or_none
+from .transfer import apply_metadata, check_destination, copy_file, stat_or_none
 
 # How many discovered files may wait for the copier. Bounded so a huge
 # tree cannot fill memory while the (fast) walk runs ahead of the (slow) copy.
@@ -43,6 +43,17 @@ class _Job:
 
 
 @dataclass
+class _Dir:
+    """A destination directory, and what to do to it when the job ends."""
+
+    path: str
+    mode: int  # the source directory's mode
+    mtime: int
+    apply_source: bool  # set mode+mtime from the source? (only if we created it, or --overwrite)
+    restore_mode: int | None  # original mode, if we had to make it writable
+
+
+@dataclass
 class _State:
     """Everything the walker and the copier share."""
 
@@ -52,9 +63,10 @@ class _State:
     dst_root: str
     on_event: Callable
     links: bool
+    overwrite: bool
     result: TreeResult
     queue: asyncio.Queue
-    dirs: list = field(default_factory=list)  # (dst_path, mode, mtime), parents first
+    dirs: list = field(default_factory=list)  # _Dir records, parents first
     files_found: int = 0
     bytes_found: int = 0
     files_done: int = 0
@@ -104,18 +116,28 @@ def _printable(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-async def _ensure_dir(state: _State, dst_dir: str) -> None:
-    """Create a destination directory unless it already exists."""
+async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> None:
+    """Make sure a destination directory exists, and record it for the final pass."""
+    # Directories that already existed are left exactly as found: we only
+    # set mode/mtime on directories we created (or when --overwrite is given).
+    # Trade-off: after an interrupted copy, the directories made by the first
+    # run count as "existing" on the rerun, so they keep default mode/mtime
+    # unless the rerun uses --overwrite.
     attrs = await stat_or_none(state.dst.sftp, dst_dir)
+    restore_mode = None
     if attrs is None:
         await state.dst.sftp.mkdir(dst_dir)
+        created = True
     elif not stat.S_ISDIR(attrs.permissions or 0):
         raise TransferError(f"'{dst_dir}' exists and is not a directory")
-    elif (attrs.permissions & 0o300) != 0o300:
-        # An earlier run may have left this directory read-only (we copy the
-        # source's mode, e.g. 0555). We must be able to write into it now;
-        # the final metadata pass sets the original mode again.
-        await state.dst.sftp.chmod(dst_dir, (attrs.permissions & 0o7777) | 0o700)
+    else:
+        created = False
+        if (attrs.permissions & 0o300) != 0o300:
+            # Not writable by us (e.g. left at 0555). Open it up so we can add
+            # files, and remember the original mode to put back at the end.
+            restore_mode = attrs.permissions & 0o7777
+            await state.dst.sftp.chmod(dst_dir, restore_mode | 0o700)
+    state.dirs.append(_Dir(dst_dir, mode, mtime, created or state.overwrite, restore_mode))
 
 
 async def _walk_dir(state: _State, src_dir: str, dst_dir: str, pending: list) -> None:
@@ -161,13 +183,12 @@ async def _handle_entry(state, src_dir, dst_dir, name, attrs, jobs, subdirs) -> 
 
     if kind == "dir":
         try:
-            await _ensure_dir(state, dst_path)
+            await _ensure_dir(state, dst_path, mode, attrs.mtime or 0)
         except (TransferError, asyncssh.SFTPError) as error:
             if not _is_per_entry_error(error):
                 raise
             state.fail(src_path, f"cannot create directory: {getattr(error, 'reason', error)}")
             return
-        state.dirs.append((dst_path, mode, attrs.mtime or 0))
         subdirs.append((src_path, dst_path))
     elif kind == "file":
         jobs.append(_Job(src_path, dst_path, attrs.size or 0, attrs.mtime or 0))
@@ -192,8 +213,7 @@ async def _read_link(state: _State, src_path: str) -> str | None:
 
 async def _walker(state: _State, src_attrs) -> None:
     """Walk the source tree depth-first, feeding the copier's queue."""
-    await _ensure_dir(state, state.dst_root)
-    state.dirs.append((state.dst_root, src_attrs.permissions or 0o755, src_attrs.mtime or 0))
+    await _ensure_dir(state, state.dst_root, src_attrs.permissions or 0o755, src_attrs.mtime or 0)
     pending = [(state.src_root, state.dst_root)]  # explicit stack: no recursion limit
     while pending:
         src_dir, dst_dir = pending.pop()
@@ -203,25 +223,23 @@ async def _walker(state: _State, src_attrs) -> None:
     await state.queue.put(None)  # tells the copier there is nothing more
 
 
-async def _is_already_copied(state: _State, job: _Job) -> bool:
-    """True if the final file exists with the same size and mtime."""
-    attrs = await stat_or_none(state.dst.sftp, job.dst_path)
-    if attrs is None or not stat.S_ISREG(attrs.permissions or 0):
-        return False
-    return attrs.size == job.size and attrs.mtime == job.mtime
-
-
-async def _make_link(state: _State, job: _Job) -> None:
-    """Create a symlink on the destination, replacing an existing link."""
+async def _make_link(state: _State, job: _Job) -> bool:
+    """Create a symlink on the destination. Returns False if it was already there."""
     sftp = state.dst.sftp
     existing = await stat_or_none_lstat(sftp, job.dst_path)
     if existing is not None:
+        is_link = stat.S_ISLNK(existing.permissions or 0)
+        if is_link and await sftp.readlink(job.dst_path) == job.link_target:
+            return False
+        if not state.overwrite:
+            raise ConflictError(job.dst_path)
         if stat.S_ISDIR(existing.permissions or 0):
-            raise TransferError(f"'{job.dst_path}' is a directory")
+            raise TransferError(f"'{job.dst_path}' is a directory; not replacing it")
         await sftp.remove(job.dst_path)
     # asyncssh's symlink() takes (target, link_path) like os.symlink and
     # fixes the argument order that OpenSSH uses on the wire by itself.
     await sftp.symlink(job.link_target, job.dst_path)
+    return True
 
 
 async def stat_or_none_lstat(sftp, path: str):
@@ -235,9 +253,11 @@ async def stat_or_none_lstat(sftp, path: str):
 async def _copy_one(state: _State, job: _Job, copy_args: dict) -> None:
     """Copy (or skip) one job, updating the counters."""
     if job.link_target is not None:
-        await _make_link(state, job)
-        state.result.copied += 1
-    elif await _is_already_copied(state, job):
+        if await _make_link(state, job):
+            state.result.copied += 1
+        else:
+            state.skip(job.src_path, "already copied")
+    elif await check_destination(state.dst.sftp, job.dst_path, job.size, job.mtime, state.overwrite):
         state.skip(job.src_path, "already copied")
     else:
         await copy_file(state.src, job.src_path, state.dst, job.dst_path, state.on_event, **copy_args)
@@ -260,17 +280,26 @@ async def _copier(state: _State, copy_args: dict) -> None:
 
 
 async def _apply_directory_metadata(state: _State) -> None:
-    """Set directory modes and mtimes, deepest first."""
+    """Final pass over the directories, deepest first."""
     # Writing a child changes its parent's mtime, so parents must be done
     # last. `dirs` lists parents before children; reversed is deepest first.
-    for dst_path, mode, mtime in reversed(state.dirs):
+    for entry in reversed(state.dirs):
         try:
-            await apply_metadata(state.dst.sftp, dst_path, mode, mtime)
+            await _finish_dir(state, entry)
         except (TransferError, asyncssh.SFTPError) as error:
             if not _is_per_entry_error(error):
                 raise
             reason = getattr(error, "reason", None) or error
-            state.fail(dst_path, f"cannot set permissions/time: {reason}")
+            state.fail(entry.path, f"cannot set permissions/time: {reason}")
+
+
+async def _finish_dir(state: _State, entry: _Dir) -> None:
+    if entry.apply_source:
+        await apply_metadata(state.dst.sftp, entry.path, entry.mode, entry.mtime)
+    elif entry.restore_mode is not None:
+        # Leave existing directories exactly as found: put back the mode
+        # we changed so we could write into it.
+        await state.dst.sftp.chmod(entry.path, entry.restore_mode)
 
 
 async def copy_tree(
@@ -282,6 +311,7 @@ async def copy_tree(
     *,
     links: bool = False,
     verify: bool = False,
+    overwrite: bool = False,
     chunk_size: int = 4 * 1024 * 1024,
     queue_depth: int = 4,
 ) -> TreeResult:
@@ -291,10 +321,10 @@ async def copy_tree(
         raise TransferError(f"'{src_path}' is not a directory")
 
     state = _State(
-        src, dst, src_path, dst_path, on_event, links, TreeResult(),
+        src, dst, src_path, dst_path, on_event, links, overwrite, TreeResult(),
         asyncio.Queue(maxsize=WALK_QUEUE_SIZE),
     )
-    copy_args = {"verify": verify, "chunk_size": chunk_size, "queue_depth": queue_depth}
+    copy_args = {"verify": verify, "overwrite": overwrite, "chunk_size": chunk_size, "queue_depth": queue_depth}
     # Same TaskGroup pattern as transfer.py: a crash in one task cancels the other.
     try:
         async with asyncio.TaskGroup() as group:
