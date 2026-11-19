@@ -26,10 +26,19 @@ async def stat_or_none(sftp, path: str):
         return None
 
 
-async def resolve_destination(dst_sftp, src_path: str, dst_path: str) -> str:
-    """Apply the cp rule: an existing directory receives the file inside it."""
+async def resolve_destination(
+    dst_sftp, src_path: str, dst_path: str, *, src_host: str | None = None, src_is_dir: bool = False
+) -> str:
+    """Apply the cp rule: an existing directory receives the file inside it.
+
+    One exception: if the source is a directory and dst_path holds hopsync's
+    "incomplete copy" marker for this very source, an earlier run was
+    interrupted, so we continue in dst_path itself instead of nesting.
+    """
     attrs = await stat_or_none(dst_sftp, dst_path)
     if attrs is not None and stat.S_ISDIR(attrs.permissions or 0):
+        if src_is_dir and await resume.read_marker(dst_sftp, dst_path) == resume.make_marker(src_host, src_path):
+            return dst_path
         if posixpath.basename(src_path) in ("", ".", ".."):
             raise TransferError("cannot tell the source's name; give the destination an explicit name")
         return posixpath.join(dst_path, posixpath.basename(src_path))

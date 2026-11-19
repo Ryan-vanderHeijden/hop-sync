@@ -64,6 +64,7 @@ class _State:
     on_event: Callable
     links: bool
     overwrite: bool
+    created_dirs: set
     result: TreeResult
     queue: asyncio.Queue
     dirs: list = field(default_factory=list)  # _Dir records, parents first
@@ -72,6 +73,7 @@ class _State:
     files_done: int = 0
     bytes_done: int = 0
     walk_complete: bool = False
+    marker: dict = field(default_factory=dict)  # see resume.make_marker
 
     def emit_progress(self) -> None:
         self.on_event(
@@ -94,7 +96,7 @@ class _State:
 def classify_entry(name: str, mode: int) -> str:
     """Name what an entry is: dir, file, symlink, or a skip reason."""
     # Uses the entry's own (lstat-style) mode, so links are never followed.
-    if name.endswith(resume.PART_SUFFIX) or name.endswith(resume.PART_SUFFIX + resume.META_SUFFIX):
+    if name == resume.MARKER_NAME or name.endswith(resume.PART_SUFFIX) or name.endswith(resume.PART_SUFFIX + resume.META_SUFFIX):
         return "hopsync temp file"
     if stat.S_ISDIR(mode):
         return "dir"
@@ -105,9 +107,13 @@ def classify_entry(name: str, mode: int) -> str:
     return "special file"
 
 
-def _is_per_entry_error(error: Exception) -> bool:
+def _is_per_entry_error(state: "_State", error: Exception) -> bool:
     """True for errors that only affect one entry; the job carries on."""
     if isinstance(error, _FATAL_SFTP_ERRORS):
+        return False
+    # If either connection is gone, any SFTP error is really a drop: stop, so
+    # the job can reconnect instead of marking every remaining file failed.
+    if state.src.conn.is_closed() or state.dst.conn.is_closed():
         return False
     return isinstance(error, (TransferError, asyncssh.SFTPError))
 
@@ -116,28 +122,35 @@ def _printable(raw: bytes) -> str:
     return raw.decode("utf-8", "replace")
 
 
-async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> None:
-    """Make sure a destination directory exists, and record it for the final pass."""
+async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> bool:
+    """Make sure a destination directory exists, and record it for the final pass.
+
+    Returns True if this call created the directory."""
     # Directories that already existed are left exactly as found: we only
     # set mode/mtime on directories we created (or when --overwrite is given).
-    # Trade-off: after an interrupted copy, the directories made by the first
-    # run count as "existing" on the rerun, so they keep default mode/mtime
-    # unless the rerun uses --overwrite.
+    # `created_dirs` remembers directories made earlier by the SAME job (an
+    # automatic or manual retry), so they still count as ours. Trade-off: after
+    # an interrupted run of the command line tool, a rerun is a new job, so
+    # directories made by the first run count as "existing" and keep their
+    # default mode/mtime unless the rerun uses --overwrite.
     attrs = await stat_or_none(state.dst.sftp, dst_dir)
     restore_mode = None
+    created_now = attrs is None
     if attrs is None:
         await state.dst.sftp.mkdir(dst_dir)
         created = True
+        state.created_dirs.add(dst_dir)
     elif not stat.S_ISDIR(attrs.permissions or 0):
         raise TransferError(f"'{dst_dir}' exists and is not a directory")
     else:
-        created = False
+        created = dst_dir in state.created_dirs
         if (attrs.permissions & 0o300) != 0o300:
             # Not writable by us (e.g. left at 0555). Open it up so we can add
             # files, and remember the original mode to put back at the end.
             restore_mode = attrs.permissions & 0o7777
             await state.dst.sftp.chmod(dst_dir, restore_mode | 0o700)
     state.dirs.append(_Dir(dst_dir, mode, mtime, created or state.overwrite, restore_mode))
+    return created_now
 
 
 async def _walk_dir(state: _State, src_dir: str, dst_dir: str, pending: list) -> None:
@@ -147,7 +160,7 @@ async def _walk_dir(state: _State, src_dir: str, dst_dir: str, pending: list) ->
         # encoded name cannot break the whole listing.
         entries = await state.src.sftp.readdir(src_dir.encode("utf-8"))
     except asyncssh.SFTPError as error:
-        if not _is_per_entry_error(error):
+        if not _is_per_entry_error(state, error):
             raise
         state.fail(src_dir, f"cannot list directory: {error.reason}")
         return
@@ -185,7 +198,7 @@ async def _handle_entry(state, src_dir, dst_dir, name, attrs, jobs, subdirs) -> 
         try:
             await _ensure_dir(state, dst_path, mode, attrs.mtime or 0)
         except (TransferError, asyncssh.SFTPError) as error:
-            if not _is_per_entry_error(error):
+            if not _is_per_entry_error(state, error):
                 raise
             state.fail(src_path, f"cannot create directory: {getattr(error, 'reason', error)}")
             return
@@ -205,7 +218,7 @@ async def _read_link(state: _State, src_path: str) -> str | None:
     try:
         return await state.src.sftp.readlink(src_path)
     except asyncssh.SFTPError as error:
-        if not _is_per_entry_error(error):
+        if not _is_per_entry_error(state, error):
             raise
         state.fail(src_path, f"cannot read link: {error.reason}")
         return None
@@ -213,7 +226,12 @@ async def _read_link(state: _State, src_path: str) -> str | None:
 
 async def _walker(state: _State, src_attrs) -> None:
     """Walk the source tree depth-first, feeding the copier's queue."""
-    await _ensure_dir(state, state.dst_root, src_attrs.permissions or 0o755, src_attrs.mtime or 0)
+    created_now = await _ensure_dir(state, state.dst_root, src_attrs.permissions or 0o755, src_attrs.mtime or 0)
+    if created_now:
+        # Only in a directory WE created: a marker saying "unfinished copy of
+        # this source", so a rerun continues here instead of nesting. Never
+        # written into an existing directory (that is the user's data).
+        await resume.write_marker(state.dst.sftp, state.dst_root, state.marker)
     pending = [(state.src_root, state.dst_root)]  # explicit stack: no recursion limit
     while pending:
         src_dir, dst_dir = pending.pop()
@@ -271,7 +289,7 @@ async def _copier(state: _State, copy_args: dict) -> None:
         try:
             await _copy_one(state, job, copy_args)
         except (TransferError, asyncssh.SFTPError) as error:
-            if not _is_per_entry_error(error):
+            if not _is_per_entry_error(state, error):
                 raise
             state.fail(job.src_path, str(getattr(error, "reason", None) or error))
         state.files_done += 1
@@ -287,7 +305,7 @@ async def _apply_directory_metadata(state: _State) -> None:
         try:
             await _finish_dir(state, entry)
         except (TransferError, asyncssh.SFTPError) as error:
-            if not _is_per_entry_error(error):
+            if not _is_per_entry_error(state, error):
                 raise
             reason = getattr(error, "reason", None) or error
             state.fail(entry.path, f"cannot set permissions/time: {reason}")
@@ -312,6 +330,7 @@ async def copy_tree(
     links: bool = False,
     verify: bool = False,
     overwrite: bool = False,
+    created_dirs: set | None = None,
     chunk_size: int = 4 * 1024 * 1024,
     queue_depth: int = 4,
 ) -> TreeResult:
@@ -321,8 +340,10 @@ async def copy_tree(
         raise TransferError(f"'{src_path}' is not a directory")
 
     state = _State(
-        src, dst, src_path, dst_path, on_event, links, overwrite, TreeResult(),
+        src, dst, src_path, dst_path, on_event, links, overwrite,
+        created_dirs if created_dirs is not None else set(), TreeResult(),
         asyncio.Queue(maxsize=WALK_QUEUE_SIZE),
+        marker=resume.make_marker(src.alias, src_path),
     )
     copy_args = {"verify": verify, "overwrite": overwrite, "chunk_size": chunk_size, "queue_depth": queue_depth}
     # Same TaskGroup pattern as transfer.py: a crash in one task cancels the other.
@@ -333,5 +354,9 @@ async def copy_tree(
     except ExceptionGroup as group_error:
         raise group_error.exceptions[0] from None
 
+    # Finished without failures: the marker is no longer needed. Removed
+    # before the metadata pass because deleting a file changes the directory's mtime.
+    if state.result.failed == 0:
+        await resume.remove_marker_if_ours(dst.sftp, dst_path, state.marker)
     await _apply_directory_metadata(state)
     return state.result

@@ -1,5 +1,6 @@
 """Directory-copy tests with in-memory fakes."""
 
+import json
 import stat
 
 import asyncssh
@@ -7,6 +8,7 @@ import pytest
 from fakes import FakeSFTP, add_file, endpoints
 
 from hopsync.core.events import EntryFailed, EntrySkipped, TransferFinished, TreeProgress
+from hopsync.core.transfer import resolve_destination
 from hopsync.core.tree import classify_entry, copy_tree
 
 
@@ -262,3 +264,115 @@ async def test_created_directories_get_source_metadata_without_overwrite():
     src.sftp.dir_meta["/src/sub"] = [0o700, 900]
     await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
     assert dst.sftp.dir_meta["/dst/src/sub"] == [0o700, 900]
+
+
+# ---- marker for unfinished tree copies ------------------------------------
+
+MARKER = "/dst/src/.hopsync-incomplete.json"
+
+
+def put_marker(sftp, top, host="hpc", path="/src"):
+    marker = json.dumps({"version": 1, "source_host": host, "source_path": path}).encode()
+    add_file(sftp, top + "/.hopsync-incomplete.json", marker)
+
+
+async def test_resolve_continues_into_directory_with_matching_marker():
+    dst = FakeSFTP(dirs={"newname"})
+    put_marker(dst, "newname", path="srcdir")
+    kw = {"src_host": "hpc", "src_is_dir": True}
+    assert await resolve_destination(dst, "srcdir", "newname", **kw) == "newname"
+
+
+@pytest.mark.parametrize(
+    "marker_host, marker_path, src_is_dir",
+    [("other", "srcdir", True), ("hpc", "elsewhere", True), ("hpc", "srcdir", False)],
+)
+async def test_resolve_nests_when_marker_does_not_match(marker_host, marker_path, src_is_dir):
+    dst = FakeSFTP(dirs={"newname"})
+    put_marker(dst, "newname", host=marker_host, path=marker_path)
+    result = await resolve_destination(dst, "srcdir", "newname", src_host="hpc", src_is_dir=src_is_dir)
+    assert result == "newname/srcdir"
+
+
+async def test_resolve_nests_without_or_with_unreadable_marker():
+    dst = FakeSFTP(dirs={"newname"})
+    kw = {"src_host": "hpc", "src_is_dir": True}
+    assert await resolve_destination(dst, "srcdir", "newname", **kw) == "newname/srcdir"
+    add_file(dst, "newname/.hopsync-incomplete.json", b"{not json")
+    assert await resolve_destination(dst, "srcdir", "newname", **kw) == "newname/srcdir"
+
+
+async def test_marker_is_written_in_created_top_dir_and_removed_when_clean():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    seen = []
+
+    def watch(event):
+        if isinstance(event, TransferFinished):
+            seen.append(MARKER in dst.sftp.files)  # present while the copy runs
+
+    await copy_tree(src, "/src", dst, "/dst/src", watch)
+    assert seen == [True]
+    assert MARKER not in dst.sftp.files
+
+
+async def test_marker_is_kept_when_entries_fail_and_never_made_in_existing_dirs():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"new")
+    add_file(dst.sftp, "/dst/src/a.txt", b"old", mtime=1)  # existing dir: no marker at all
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert MARKER not in dst.sftp.files
+
+    # a failing entry in a directory hopsync creates itself
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    src.sftp.files["/src/a.txt"].fail_after = 0
+    src.sftp.files["/src/a.txt"].fail_exc = asyncssh.SFTPPermissionDenied("denied")
+    result = await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert result.failed == 1
+    assert MARKER in dst.sftp.files  # kept: a rerun resumes into the same place
+
+
+async def test_no_marker_in_existing_directory():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    dst.sftp.dirs.add("/dst/src")
+    seen = []
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: seen.append(MARKER in dst.sftp.files))
+    assert not any(seen)
+
+
+async def test_marker_in_source_is_not_copied():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    add_file(src.sftp, "/src/.hopsync-incomplete.json", b"{}")
+    events = []
+    await copy_tree(src, "/src", dst, "/dst/src", events.append)
+    assert [e.reason for e in events if isinstance(e, EntrySkipped)] == ["hopsync temp file"]
+
+
+# ---- connection drops inside a tree ----------------------------------------
+
+
+async def test_sftp_error_with_closed_connection_is_fatal():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    add_file(src.sftp, "/src/b.txt", b"bbb")
+    f = src.sftp.files["/src/a.txt"]
+    f.fail_after = 0
+    f.fail_exc = asyncssh.SFTPFailure("Failure")  # an ordinary error code...
+    src.conn.closed = True  # ...but the connection is gone
+    with pytest.raises(asyncssh.SFTPFailure):
+        await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert "/dst/src/b.txt" not in dst.sftp.files
+
+
+async def test_same_error_with_open_connection_is_per_entry():
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/a.txt", b"aaa")
+    add_file(src.sftp, "/src/b.txt", b"bbb")
+    f = src.sftp.files["/src/a.txt"]
+    f.fail_after = 0
+    f.fail_exc = asyncssh.SFTPFailure("Failure")
+    result = await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert (result.copied, result.failed) == (1, 1)

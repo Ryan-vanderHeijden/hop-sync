@@ -1,6 +1,7 @@
 """Opening SSH connections. Never prompts: secrets arrive as arguments."""
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import asyncssh
@@ -13,10 +14,17 @@ class Endpoint:
     alias: str
     conn: asyncssh.SSHClientConnection
     sftp: asyncssh.SFTPClient
+    # Caps how many exec channels (sha256sum ...) run on this host at once,
+    # so file channels plus exec channels stay under sshd's MaxSessions.
+    exec_slots: asyncio.Semaphore | None = field(default=None, compare=False)
 
 
 class ConnectError(Exception):
     """Base class for connection problems with a readable message."""
+
+    def __init__(self, message: str, alias: str | None = None) -> None:
+        super().__init__(message)
+        self.alias = alias  # which host this is about
 
 
 class AuthFailed(ConnectError):
@@ -53,16 +61,21 @@ async def connect(
             password=password,
             passphrase=passphrase,
             keepalive_interval=30,
+            # Probe every 30 s and give up after 3 unanswered probes, so a
+            # silently dead link is noticed after about 90 s.
+            keepalive_count_max=3,
         )
     except asyncssh.PermissionDenied as exc:
         # Deliberately do not include the password in the message.
-        raise AuthFailed(f"authentication to '{alias}' failed ({exc.reason})") from exc
+        raise AuthFailed(f"authentication to '{alias}' failed ({exc.reason})", alias) from exc
     except asyncssh.HostKeyNotVerifiable as exc:
         raise HostKeyError(
             f"host key for '{alias}' is not trusted ({exc.reason}); "
-            "check your known_hosts file"
+            "check your known_hosts file",
+            alias,
         ) from exc
     except (asyncssh.KeyEncryptionError, asyncssh.KeyImportError) as exc:
         raise KeyNeedsPassphrase(
-            f"the private key for '{alias}' needs a (correct) passphrase"
+            f"the private key for '{alias}' needs a (correct) passphrase",
+            alias,
         ) from exc

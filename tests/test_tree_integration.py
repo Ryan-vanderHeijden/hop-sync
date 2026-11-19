@@ -117,7 +117,7 @@ async def test_cli_copies_directory_and_single_file(hosts, monkeypatch, capsys):
     monkeypatch.setattr("getpass.getpass", lambda prompt="": hosts.password)
     base = ["--config", str(hosts.config), "--password-for", "hpc", "copy"]
     assert await asyncio.to_thread(main, [*base, "--verify", "hpc:t6", "server:t6cli"]) == 0
-    assert "4 copied, 0 skipped, 0 failed" in capsys.readouterr().out
+    assert "done 5.7M" in capsys.readouterr().out
     assert await asyncio.to_thread(main, [*base, "hpc:t6/small.txt", "server:t6cli/small2.txt"]) == 0
 
 
@@ -280,3 +280,66 @@ async def test_existing_read_only_destination_directory_ends_up_unchanged(hosts,
         assert code == 0
         assert (await run(dst.conn, "cat t13holder/t13/ro/new.txt")).strip() == "added"
         assert (await run(dst.conn, "stat -c %a t13holder/t13/ro")).strip() == "555"  # as found
+
+
+MARKER_FILE = ".hopsync-incomplete.json"
+
+
+async def exists_on(conn, path):
+    return (await conn.run(f"test -e {path}", check=False)).exit_status == 0
+
+
+async def test_rerun_of_interrupted_tree_to_new_name_does_not_nest(hosts, monkeypatch):
+    from hopsync.cli import build_parser, run_copy
+
+    async with hpc_to_server(hosts) as (src, dst):
+        await run(src.conn, "rm -rf t15 && mkdir t15")
+        for n in range(5):
+            await run(src.conn, f"head -c 10000000 /dev/urandom > t15/f{n}.bin")
+        await run(dst.conn, "rm -rf t15new")
+
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": hosts.password)
+        argv = ["--config", str(hosts.config), "--password-for", "hpc", "copy", "hpc:t15", "server:t15new"]
+        task = asyncio.create_task(run_copy(build_parser().parse_args(argv)))
+        for _ in range(500):  # interrupt once the second file has started
+            await asyncio.sleep(0.01)
+            if await exists_on(dst.conn, "t15new/f1.bin.hopsync-part"):
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await exists_on(dst.conn, f"t15new/{MARKER_FILE}")  # unfinished: marker present
+
+        # The SAME command again: continues in t15new instead of making t15new/t15.
+        assert await cli_copy(hosts, monkeypatch, "hpc:t15", "server:t15new") == 0
+        assert not await exists_on(dst.conn, "t15new/t15")
+        assert not await exists_on(dst.conn, f"t15new/{MARKER_FILE}")
+        assert await run(dst.conn, HASHES.format(d="t15new")) == await run(src.conn, HASHES.format(d="t15"))
+
+
+async def test_completed_tree_copy_leaves_no_marker_and_existing_dir_gets_none(hosts):
+    async with hpc_to_server(hosts) as (src, dst):
+        await run(src.conn, "rm -rf t16 && mkdir -p t16/sub && echo x > t16/sub/f")
+        await run(dst.conn, "rm -rf t16new t16holder && mkdir t16holder")
+        await copy_tree(src, "t16", dst, "t16new", lambda e: None)
+        assert not await exists_on(dst.conn, f"t16new/{MARKER_FILE}")
+
+        # Copying into an existing directory: the directory itself never gets a marker.
+        target = await resolve_destination(dst.sftp, "t16", "t16holder", src_host="hpc", src_is_dir=True)
+        assert target == "t16holder/t16"
+        seen = []
+        await copy_tree(src, "t16", dst, target, lambda e: seen.append(1))
+        assert not await exists_on(dst.conn, f"t16holder/{MARKER_FILE}")
+        assert not await exists_on(dst.conn, f"t16holder/t16/{MARKER_FILE}")
+
+
+async def test_marker_for_a_different_source_means_normal_nesting(hosts):
+    async with hpc_to_server(hosts) as (src, dst):
+        await run(src.conn, "rm -rf t17 && mkdir t17 && echo x > t17/f")
+        await run(dst.conn, f"""rm -rf t17dst && mkdir t17dst &&
+            echo '{{"version": 1, "source_host": "hpc", "source_path": "some-other-dir"}}' > t17dst/{MARKER_FILE}""")
+        target = await resolve_destination(dst.sftp, "t17", "t17dst", src_host="hpc", src_is_dir=True)
+        assert target == "t17dst/t17"
+        await copy_tree(src, "t17", dst, target, lambda e: None)
+        assert (await run(dst.conn, "cat t17dst/t17/f")).strip() == "x"
+        assert await exists_on(dst.conn, f"t17dst/{MARKER_FILE}")  # someone else's marker untouched

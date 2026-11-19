@@ -161,6 +161,10 @@ class FakeConn:
 
     def __init__(self, sftp, lie=False):
         self.sftp, self.lie = sftp, lie
+        self.closed = False
+
+    def is_closed(self):
+        return self.closed
 
     async def run(self, command, check=False):
         path = command.split("-- ", 1)[1].strip("'")

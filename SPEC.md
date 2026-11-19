@@ -61,6 +61,7 @@ Key rule: `core` emits progress as events (callback or asyncio queue). The CLI, 
 - Preserve mtime and permission bits (not ownership, not setuid/setgid).
 - Symlinks: skip by default, with a `--links` flag to copy them as links.
 - File names that are not valid UTF-8 are skipped with a clear warning naming the parent directory.
+- An unfinished tree copy leaves `.hopsync-incomplete.json` in the top directory hopsync created; a rerun with the same source resumes into it instead of nesting.
 
 ### 3. Transfer queue
 - Job model: id, source, dest, state (queued/running/done/failed/cancelled), bytes done/total. (No pause: cancel plus resume-on-retry covers it.)

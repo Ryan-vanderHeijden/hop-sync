@@ -1,5 +1,6 @@
 """Remote checksums. The only place a remote command is built."""
 
+import contextlib
 import shlex
 
 from .errors import TransferError
@@ -11,7 +12,10 @@ async def remote_sha256(endpoint: Endpoint, path: str) -> str:
     # shlex.quote makes the path a single, harmless shell word; "--" stops
     # a path starting with "-" from being read as an option.
     command = f"sha256sum -- {shlex.quote(path)}"
-    result = await endpoint.conn.run(command, check=False)
+    # At most two of these per host at a time (see Endpoint.exec_slots).
+    slots = endpoint.exec_slots or contextlib.nullcontext()
+    async with slots:
+        result = await endpoint.conn.run(command, check=False)
     if result.exit_status == 127:
         raise TransferError(f"sha256sum is not available on {endpoint.alias}")
     if result.exit_status != 0:

@@ -1,6 +1,7 @@
 """Names and bookkeeping for partial files (<name>.hopsync-part + sidecar)."""
 
 import json
+import posixpath
 
 import asyncssh
 
@@ -73,3 +74,37 @@ async def remove_quietly(sftp, path: str) -> None:
         await sftp.remove(path)
     except asyncssh.SFTPNoSuchFile:
         pass
+
+
+# ---- marker for an unfinished directory copy --------------------------------
+
+MARKER_NAME = ".hopsync-incomplete.json"
+
+
+def marker_path(top_dir: str) -> str:
+    return posixpath.join(top_dir, MARKER_NAME)
+
+
+def make_marker(source_host: str, source_path: str) -> dict:
+    """Says: this top directory was created by hopsync for this source."""
+    return {"version": 1, "source_host": source_host, "source_path": source_path}
+
+
+async def write_marker(sftp, top_dir: str, marker: dict) -> None:
+    async with sftp.open(marker_path(top_dir), "wb") as f:
+        await f.write(json.dumps(marker).encode("utf-8"), 0)
+
+
+async def read_marker(sftp, top_dir: str) -> dict | None:
+    """Load the marker; None if missing or unreadable."""
+    try:
+        async with sftp.open(marker_path(top_dir), "rb") as f:
+            return json.loads(await f.read())
+    except (asyncssh.SFTPError, ValueError):
+        return None
+
+
+async def remove_marker_if_ours(sftp, top_dir: str, marker: dict) -> None:
+    """Delete the marker, but only if it is the one for this source."""
+    if await read_marker(sftp, top_dir) == marker:
+        await remove_quietly(sftp, marker_path(top_dir))
