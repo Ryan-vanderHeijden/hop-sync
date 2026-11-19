@@ -1,6 +1,7 @@
 """The copy pipeline: read chunks from one SFTP server, write to another."""
 
 import asyncio
+import hashlib
 import posixpath
 import stat
 import time
@@ -8,11 +9,13 @@ from collections.abc import Callable
 
 import asyncssh
 
-from .events import TransferFinished, TransferProgress, TransferStarted
+from . import resume
+from .errors import TransferError, VerificationFailed
+from .events import TransferFinished, TransferProgress, TransferStarted, Verifying
+from .session import Endpoint
+from .verify import remote_sha256
 
-
-class TransferError(Exception):
-    """A transfer problem with a readable message."""
+__all__ = ["TransferError", "copy_file", "resolve_destination"]
 
 
 async def _stat_or_none(sftp, path: str):
@@ -49,55 +52,138 @@ async def _read_chunks(src_file, queue: asyncio.Queue, chunk_size: int) -> None:
     await queue.put(None)
 
 
-async def _write_chunks(dst_file, queue: asyncio.Queue, report) -> None:
+async def _write_chunks(dst_file, queue: asyncio.Queue, offset: int, report, hasher) -> None:
     """Writer task: drain the queue until the None sentinel."""
     # Writes are parallelised by asyncssh in the same way as reads.
-    done = 0
     while (chunk := await queue.get()) is not None:
-        await dst_file.write(chunk, done)
-        done += len(chunk)
-        report(done)
+        await dst_file.write(chunk, offset)
+        if hasher is not None:
+            hasher.update(chunk)
+        offset += len(chunk)
+        report(offset)
+
+
+async def _prepare_part(dst: Endpoint, dst_path: str, expected_meta: dict, chunk_size: int) -> int:
+    """Decide resume vs fresh start. Returns the offset to continue from."""
+    saved = await resume.read_meta(dst.sftp, dst_path)
+    size = await resume.part_size(dst.sftp, dst_path)
+    # Each chunk is sent as several blocks at once. If the connection died
+    # mid-chunk, some later blocks may have arrived while earlier ones did
+    # not, leaving a hole of zeros before the reported end of the file.
+    # Every chunk before the last one finished completely, so we step back
+    # one chunk and rewrite it instead of trusting the file size.
+    offset = resume.resume_offset(saved, expected_meta, size, rewind=chunk_size)
+    if offset == 0:
+        # Truncate the old part FIRST, then write the sidecar. A crash in
+        # between leaves a part with no sidecar, which is never resumed.
+        async with dst.sftp.open(resume.part_path(dst_path), "wb"):
+            pass
+        await resume.write_meta(dst.sftp, dst_path, expected_meta)
+    return offset
+
+
+async def _stream(src_file, dst_file, offset, report, hasher, chunk_size, queue_depth) -> None:
+    """Run reader and writer together until the file is copied."""
+    # Memory budget: queue_depth (4) x chunk_size (4 MB) = 16 MB buffered at most.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=queue_depth)
+    # TaskGroup: if either task fails, the other is cancelled and the
+    # error propagates (inside an ExceptionGroup, unwrapped here).
+    try:
+        async with asyncio.TaskGroup() as group:
+            group.create_task(_read_chunks(src_file, queue, chunk_size))
+            group.create_task(_write_chunks(dst_file, queue, offset, report, hasher))
+    except ExceptionGroup as group_error:
+        raise group_error.exceptions[0] from None
+
+
+async def _discard_partial(dst: Endpoint, dst_path: str) -> None:
+    """Delete the part and sidecar: their content is known to be bad."""
+    await resume.remove_quietly(dst.sftp, resume.part_path(dst_path))
+    await resume.remove_quietly(dst.sftp, resume.meta_path(dst_path))
+
+
+async def _verify(src, src_path, dst, dst_path, total, offset, verify, hasher, on_event) -> None:
+    """Check the .part file. Raises TransferError if the data is bad."""
+    part = resume.part_path(dst_path)
+    size = await resume.part_size(dst.sftp, dst_path)
+    if size != total:
+        raise VerificationFailed(f"size mismatch: source has {total} bytes, destination has {size}")
+    if not verify:
+        on_event(Verifying(src_path, dst_path, "size"))
+        return
+
+    on_event(Verifying(src_path, dst_path, "sha256"))
+    dst_hash = await remote_sha256(dst, part)
+    if offset == 0:
+        # Fresh transfer: we hashed every byte as it streamed through.
+        expected = hasher.hexdigest()
+    else:
+        # Resumed: our hash misses the first `offset` bytes, so ask the source.
+        expected = await remote_sha256(src, src_path)
+    if dst_hash != expected:
+        raise VerificationFailed("checksum mismatch between source and destination")
+
+
+async def _finish(dst: Endpoint, dst_path: str) -> None:
+    """Move the verified .part into place and drop the sidecar."""
+    part = resume.part_path(dst_path)
+    try:
+        # posix_rename is atomic and overwrites an existing file.
+        await dst.sftp.posix_rename(part, dst_path)
+    except asyncssh.SFTPOpUnsupported:
+        await resume.remove_quietly(dst.sftp, dst_path)
+        await dst.sftp.rename(part, dst_path)
+    await resume.remove_quietly(dst.sftp, resume.meta_path(dst_path))
 
 
 async def copy_file(
-    src_sftp,
+    src: Endpoint,
     src_path: str,
-    dst_sftp,
+    dst: Endpoint,
     dst_path: str,
     on_event: Callable,
     *,
+    verify: bool = False,
     chunk_size: int = 4 * 1024 * 1024,
     queue_depth: int = 4,
 ) -> int:
-    """Copy one file between two SFTP servers. Returns the bytes copied."""
-    src_attrs = await src_sftp.stat(src_path)
+    """Copy one file between two hosts. Returns the total size of the file.
+
+    Data goes to <dst_path>.hopsync-part and is renamed only after
+    verification. If interrupted, the part file is kept so a rerun resumes.
+    """
+    src_attrs = await src.sftp.stat(src_path)
     if stat.S_ISDIR(src_attrs.permissions or 0):
         raise TransferError(f"'{src_path}' is a directory; directory copy arrives in milestone 2b")
     if not stat.S_ISREG(src_attrs.permissions or 0):
         raise TransferError(f"'{src_path}' is not a regular file")
     total = src_attrs.size or 0
 
+    meta = resume.make_meta(src.alias, src_path, total, src_attrs.mtime or 0)
+    offset = await _prepare_part(dst, dst_path, meta, chunk_size)
+
     started = time.monotonic()
-    on_event(TransferStarted(src_path, dst_path, total))
+    on_event(TransferStarted(src_path, dst_path, total, resumed_from=offset))
 
     def report(done: int) -> None:
         on_event(TransferProgress(src_path, dst_path, done, total))
 
-    # Memory budget: queue_depth (4) x chunk_size (4 MB) = 16 MB buffered at most.
-    queue: asyncio.Queue = asyncio.Queue(maxsize=queue_depth)
-    async with src_sftp.open(src_path, "rb") as src_file, dst_sftp.open(dst_path, "wb") as dst_file:
-        # TaskGroup: if either task fails, the other is cancelled and the
-        # error propagates (inside an ExceptionGroup, unwrapped below).
-        try:
-            async with asyncio.TaskGroup() as group:
-                group.create_task(_read_chunks(src_file, queue, chunk_size))
-                group.create_task(_write_chunks(dst_file, queue, report))
-        except ExceptionGroup as group_error:
-            raise group_error.exceptions[0] from None
+    # Only a fresh transfer can hash while streaming (see _verify).
+    hasher = hashlib.sha256() if verify and offset == 0 else None
+    mode = "r+b" if offset > 0 else "wb"  # r+b keeps the existing bytes
+    async with src.sftp.open(src_path, "rb") as src_file, dst.sftp.open(
+        resume.part_path(dst_path), mode
+    ) as dst_file:
+        await src_file.seek(offset)
+        await _stream(src_file, dst_file, offset, report, hasher, chunk_size, queue_depth)
 
-    dst_size = (await dst_sftp.stat(dst_path)).size
-    if dst_size != total:
-        raise TransferError(f"size mismatch: source has {total} bytes, destination has {dst_size}")
+    try:
+        await _verify(src, src_path, dst, dst_path, total, offset, verify, hasher, on_event)
+    except VerificationFailed as error:
+        # Only bad data is deleted; other failures (e.g. no sha256sum) keep the part.
+        await _discard_partial(dst, dst_path)
+        raise VerificationFailed(f"{error}; partial file removed, rerun to copy again") from None
 
+    await _finish(dst, dst_path)
     on_event(TransferFinished(src_path, dst_path, total, time.monotonic() - started))
     return total

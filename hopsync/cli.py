@@ -9,10 +9,10 @@ from datetime import datetime
 
 import asyncssh
 
-from .core.events import TransferFinished, TransferProgress
+from .core.events import TransferFinished, TransferProgress, TransferStarted, Verifying
 from .core.listing import list_dir
 from .core.paths import parse_remote
-from .core.session import ConnectError, KeyNeedsPassphrase, connect
+from .core.session import ConnectError, Endpoint, KeyNeedsPassphrase, connect
 from .core.transfer import TransferError, copy_file, resolve_destination
 
 
@@ -36,16 +36,29 @@ class ProgressBar:
     def __init__(self) -> None:
         self.start = time.monotonic()
         self.last_draw = 0.0
+        self.resumed_from = 0
 
     def __call__(self, event) -> None:
-        if isinstance(event, TransferProgress):
+        if isinstance(event, TransferStarted):
+            self.resumed_from = event.resumed_from
+            if event.resumed_from:
+                print(f"resuming from {human_size(event.resumed_from)}", file=sys.stderr)
+        elif isinstance(event, Verifying):
+            self.clear()
+            print(f"verifying ({event.method})...", file=sys.stderr)
+        elif isinstance(event, TransferProgress):
             now = time.monotonic()
             if now - self.last_draw >= 0.1:
                 self.last_draw = now
                 self.draw(event.bytes_done, event.total_bytes, now - self.start)
 
+    def clear(self) -> None:
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 70 + "\r")
+
     def draw(self, done: int, total: int, elapsed: float) -> None:
-        rate = done / elapsed if elapsed > 0 else 0
+        # Speed and ETA count only bytes moved in this run, not the resumed prefix.
+        rate = (done - self.resumed_from) / elapsed if elapsed > 0 else 0
         percent = 100 * done / total if total else 100
         eta = format_eta((total - done) / rate) if rate > 0 else "--:--"
         line = (
@@ -56,10 +69,10 @@ class ProgressBar:
         sys.stderr.flush()
 
 
-def print_summary(event: TransferFinished) -> None:
-    """Final line: total size, time and average throughput."""
-    rate = event.bytes_done / event.seconds / 1e6 if event.seconds > 0 else 0
-    sys.stderr.write("\r" + " " * 70 + "\r")
+def print_summary(event: TransferFinished, resumed_from: int) -> None:
+    """Final line: total size, time and average throughput of this run."""
+    moved = event.bytes_done - resumed_from
+    rate = moved / event.seconds / 1e6 if event.seconds > 0 else 0
     print(f"copied {human_size(event.bytes_done)} in {event.seconds:.1f}s ({rate:.1f} MB/s average)")
 
 
@@ -107,6 +120,8 @@ async def run_copy(args) -> None:
         dst_conn = await open_connection(dst.host, args, passwords)
         connections.append(dst_conn)
         async with src_conn.start_sftp_client() as src_sftp, dst_conn.start_sftp_client() as dst_sftp:
+            src_end = Endpoint(src.host, src_conn, src_sftp)
+            dst_end = Endpoint(dst.host, dst_conn, dst_sftp)
             dst_path = await resolve_destination(dst_sftp, src.path, dst.path)
             bar = ProgressBar()
             finished = []
@@ -116,8 +131,9 @@ async def run_copy(args) -> None:
                 if isinstance(event, TransferFinished):
                     finished.append(event)
 
-            await copy_file(src_sftp, src.path, dst_sftp, dst_path, on_event)
-            print_summary(finished[0])
+            await copy_file(src_end, src.path, dst_end, dst_path, on_event, verify=args.verify)
+            bar.clear()
+            print_summary(finished[0], bar.resumed_from)
     finally:
         for conn in connections:
             conn.close()
@@ -137,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     copy_cmd = sub.add_parser("copy", help="copy one file between hosts")
     copy_cmd.add_argument("src", metavar="SRC_ALIAS:PATH")
     copy_cmd.add_argument("dst", metavar="DST_ALIAS:PATH")
+    copy_cmd.add_argument("--verify", action="store_true", help="also compare sha256 checksums")
     return parser
 
 
@@ -146,15 +163,18 @@ def main(argv=None) -> int:
     try:
         asyncio.run(runner(args))
     except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
+        print("\ninterrupted" + KEPT_HINT.get(args.command, ""), file=sys.stderr)
         return 130
     except (ConnectError, TransferError, ValueError) as exc:
         return fail(str(exc))
     except asyncssh.SFTPError as exc:
         return fail(f"SFTP error: {exc.reason}")
     except (asyncssh.Error, OSError) as exc:
-        return fail(f"connection problem: {exc}")
+        return fail(f"connection problem: {exc}" + KEPT_HINT.get(args.command, ""))
     return 0
+
+
+KEPT_HINT = {"copy": "; partial file kept; run the same command again to resume"}
 
 
 def fail(message: str) -> int:

@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from hopsync.core.session import connect
+from hopsync.core.session import Endpoint, connect
 from hopsync.core.transfer import copy_file
 
 pytestmark = [pytest.mark.slow, pytest.mark.integration]
@@ -43,7 +43,7 @@ async def test_one_gib_copy(hosts):
         watcher = asyncio.create_task(watch_rss(peak))
         start = time.monotonic()
         async with hpc.start_sftp_client() as s, server.start_sftp_client() as d:
-            n = await copy_file(s, "big.bin", d, "big.bin", lambda e: None)
+            n = await copy_file(Endpoint("hpc", hpc, s), "big.bin", Endpoint("server", server, d), "big.bin", lambda e: None)
         seconds = time.monotonic() - start
         watcher.cancel()
 

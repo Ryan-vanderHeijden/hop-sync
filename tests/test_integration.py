@@ -1,11 +1,15 @@
 """Tests against the docker hosts (see conftest.py)."""
 
 import hashlib
+import os
+from contextlib import asynccontextmanager
 
 import pytest
 
 from hopsync.core.listing import list_dir
-from hopsync.core.session import AuthFailed, ConnectError, HostKeyError, connect
+from hopsync.core.events import TransferProgress, TransferStarted
+from hopsync.core.errors import VerificationFailed
+from hopsync.core.session import AuthFailed, ConnectError, Endpoint, HostKeyError, connect
 from hopsync.core.transfer import copy_file, resolve_destination
 
 pytestmark = pytest.mark.integration
@@ -13,6 +17,35 @@ pytestmark = pytest.mark.integration
 
 async def open_host(hosts, alias, password=None):
     return await connect(alias, password=password, config_path=hosts.config)
+
+
+@asynccontextmanager
+async def hpc_to_server(hosts):
+    """Fresh connections (src=hpc, dst=server); closed on exit."""
+    hpc = await open_host(hosts, "hpc", hosts.password)
+    server = await open_host(hosts, "server")
+    try:
+        async with hpc.start_sftp_client() as s, server.start_sftp_client() as d:
+            yield Endpoint("hpc", hpc, s), Endpoint("server", server, d)
+    finally:
+        for conn in (hpc, server):
+            conn.close()
+            await conn.wait_closed()
+
+
+async def interrupted_copy(hosts, src_path, dst_path, abort_after=10_000_000):
+    """Start a copy and kill the destination connection part-way through."""
+    async with hpc_to_server(hosts) as (src, dst):
+        def kill_connection(event):
+            if isinstance(event, TransferProgress) and event.bytes_done > abort_after:
+                dst.conn.abort()
+
+        with pytest.raises(Exception):
+            await copy_file(src, src_path, dst, dst_path, kill_connection, chunk_size=1_000_000)
+
+
+async def exists(conn, path):
+    return (await conn.run(f"test -e {path}", check=False)).exit_status == 0
 
 
 async def sha256_remote(conn, path):
@@ -56,7 +89,7 @@ async def test_copy_between_hosts(both, direction):
     await put_file(src, "src.bin", data)
     events = []
     async with src.start_sftp_client() as s, dst.start_sftp_client() as d:
-        n = await copy_file(s, "src.bin", d, "dst.bin", events.append)
+        n = await copy_file(Endpoint("src", src, s), "src.bin", Endpoint("dst", dst, d), "dst.bin", events.append)
     assert n == len(data)
     assert events
     assert await sha256_remote(dst, "dst.bin") == hashlib.sha256(data).hexdigest()
@@ -69,7 +102,7 @@ async def test_copy_into_existing_directory(both):
         await d.makedirs("intodir", exist_ok=True)
         target = await resolve_destination(d, "named.bin", "intodir")
         assert target == "intodir/named.bin"
-        await copy_file(s, "named.bin", d, target, lambda e: None)
+        await copy_file(Endpoint("hpc", hpc, s), "named.bin", Endpoint("server", server, d), target, lambda e: None)
         assert await d.exists("intodir/named.bin")
 
 
@@ -91,3 +124,80 @@ async def test_unknown_host_key(hosts):
 
 def test_errors_share_base():
     assert issubclass(AuthFailed, ConnectError)
+
+
+async def test_fresh_copy_leaves_no_partial_files(hosts):
+    data = os.urandom(3_000_000)
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "fresh.bin", data)
+        await copy_file(src, "fresh.bin", dst, "fresh.bin", lambda e: None)
+        assert not await exists(dst.conn, "fresh.bin.hopsync-part")
+        assert not await exists(dst.conn, "fresh.bin.hopsync-part.json")
+        assert await sha256_remote(dst.conn, "fresh.bin") == hashlib.sha256(data).hexdigest()
+
+
+async def test_verify_on_fresh_copy(hosts):
+    data = os.urandom(3_000_000)
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "v.bin", data)
+        await copy_file(src, "v.bin", dst, "v.bin", lambda e: None, verify=True)
+        assert await sha256_remote(dst.conn, "v.bin") == hashlib.sha256(data).hexdigest()
+
+
+async def test_resume_after_killed_connection(hosts):
+    data = os.urandom(40_000_000)
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "big.bin", data)
+    await interrupted_copy(hosts, "big.bin", "big.bin")
+
+    async with hpc_to_server(hosts) as (src, dst):
+        assert await exists(dst.conn, "big.bin.hopsync-part")
+        assert await exists(dst.conn, "big.bin.hopsync-part.json")
+        assert not await exists(dst.conn, "big.bin")
+
+        events = []
+        await copy_file(src, "big.bin", dst, "big.bin", events.append, verify=True, chunk_size=1_000_000)
+        started = next(e for e in events if isinstance(e, TransferStarted))
+        assert started.resumed_from > 0
+        assert await sha256_remote(dst.conn, "big.bin") == hashlib.sha256(data).hexdigest()
+        assert not await exists(dst.conn, "big.bin.hopsync-part.json")
+
+
+async def test_changed_source_starts_over(hosts):
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "chg.bin", os.urandom(30_000_000))
+    await interrupted_copy(hosts, "chg.bin", "chg.bin", abort_after=5_000_000)
+
+    new_data = os.urandom(20_000_000)  # different size (and mtime)
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "chg.bin", new_data)
+        events = []
+        await copy_file(src, "chg.bin", dst, "chg.bin", events.append)
+        assert next(e for e in events if isinstance(e, TransferStarted)).resumed_from == 0
+        assert await sha256_remote(dst.conn, "chg.bin") == hashlib.sha256(new_data).hexdigest()
+
+
+async def test_corrupted_part_fails_verification(hosts):
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(src.conn, "bad.bin", os.urandom(30_000_000))
+    await interrupted_copy(hosts, "bad.bin", "bad.bin", abort_after=5_000_000)
+
+    async with hpc_to_server(hosts) as (src, dst):
+        # Test-only: damage 4 bytes inside the already-written prefix.
+        await dst.conn.run(
+            "printf 'XXXX' | dd of=bad.bin.hopsync-part bs=1 seek=1000 conv=notrunc", check=True
+        )
+        with pytest.raises(VerificationFailed, match="checksum mismatch"):
+            await copy_file(src, "bad.bin", dst, "bad.bin", lambda e: None, verify=True)
+        assert not await exists(dst.conn, "bad.bin.hopsync-part")
+        assert not await exists(dst.conn, "bad.bin.hopsync-part.json")
+        assert not await exists(dst.conn, "bad.bin")
+
+
+async def test_overwrite_existing_destination(hosts):
+    new_data = os.urandom(2_000_000)
+    async with hpc_to_server(hosts) as (src, dst):
+        await put_file(dst.conn, "over.bin", b"old contents")
+        await put_file(src.conn, "over.bin", new_data)
+        await copy_file(src, "over.bin", dst, "over.bin", lambda e: None)
+        assert await sha256_remote(dst.conn, "over.bin") == hashlib.sha256(new_data).hexdigest()

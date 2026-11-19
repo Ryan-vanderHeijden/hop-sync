@@ -8,6 +8,7 @@ class TransferStarted:
     src: str
     dst: str
     total_bytes: int
+    resumed_from: int = 0  # bytes already on the destination (0 = fresh)
 
 
 @dataclass(frozen=True)
@@ -24,3 +25,10 @@ class TransferFinished:
     dst: str
     bytes_done: int
     seconds: float
+
+
+@dataclass(frozen=True)
+class Verifying:
+    src: str
+    dst: str
+    method: str  # "size" or "sha256"

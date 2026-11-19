@@ -1,8 +1,18 @@
 """Opening SSH connections. Never prompts: secrets arrive as arguments."""
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import asyncssh
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """One host: its SSH connection (for commands) and SFTP channel (for files)."""
+
+    alias: str
+    conn: asyncssh.SSHClientConnection
+    sftp: asyncssh.SFTPClient
 
 
 class ConnectError(Exception):
