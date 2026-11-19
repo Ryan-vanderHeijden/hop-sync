@@ -7,10 +7,10 @@ name = "hopsync"
 version = "0.1.0"
 description = "Relay files between two SFTP hosts through this computer"
 requires-python = ">=3.11"
-dependencies = ["asyncssh"]
+dependencies = ["asyncssh", "fastapi", "uvicorn", "websockets"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.scripts]
 hopsync = "hopsync.cli:main"

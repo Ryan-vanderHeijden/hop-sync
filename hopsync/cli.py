@@ -255,6 +255,12 @@ async def run_copy(args) -> int:
     return 1 if any(job.state is not JobState.DONE for job in manager.list()) else 0
 
 
+async def run_serve(args) -> int:
+    from .api.serve import run_serve as serve  # imported here: list/copy do not need the web stack
+
+    return await serve(args)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hopsync")
     parser.add_argument("--config", help="ssh config file (default ~/.ssh/config)")
@@ -265,6 +271,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     list_cmd = sub.add_parser("list", help="list a remote directory")
     list_cmd.add_argument("target", metavar="ALIAS:PATH")
+    serve_cmd = sub.add_parser("serve", help="start the local web server")
+    serve_cmd.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: pick a free one)")
+    serve_cmd.add_argument("--no-browser", action="store_true", help="do not open the browser")
     copy_cmd = sub.add_parser("copy", help="copy files or directories between hosts")
     copy_cmd.add_argument("paths", nargs="+", metavar="SRC... DST", help="one or more sources, then the destination")
     copy_cmd.add_argument("--jobs", type=int, default=2, help="copies running at once (default 2)")
@@ -283,7 +292,7 @@ def main(argv=None) -> int:
         parser.error("copy needs at least one source and a destination")
     if args.command == "copy" and args.jobs < 1:
         parser.error("--jobs must be at least 1")
-    runner = run_list if args.command == "list" else run_copy
+    runner = {"list": run_list, "copy": run_copy, "serve": run_serve}[args.command]
     try:
         return asyncio.run(runner(args)) or 0
     except KeyboardInterrupt:

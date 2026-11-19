@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>hopsync</title>
+</head>
+<body>
+  <h1>hopsync</h1>
+  <p id="status">connecting...</p>
+  <pre id="jobs"></pre>
+  <script>
+    // Placeholder page: shows the jobs JSON as it changes.
+    const jobs = {};
+    const out = document.getElementById("jobs");
+    const status = document.getElementById("status");
+    function show() { out.textContent = JSON.stringify(Object.values(jobs), null, 2); }
+    const socket = new WebSocket("ws://" + location.host + "/api/events");
+    socket.onopen = () => { status.textContent = "connected"; };
+    socket.onclose = () => { status.textContent = "disconnected (reload to reconnect)"; };
+    socket.onmessage = (message) => {
+      const data = JSON.parse(message.data);
+      if (data.type === "snapshot") {
+        for (const key in jobs) delete jobs[key];
+        data.jobs.forEach((job) => { jobs[job.id] = job; });
+      } else if (data.type === "job") {
+        jobs[data.job.id] = data.job;
+      }
+      show();
+    };
+  </script>
+</body>
+</html>

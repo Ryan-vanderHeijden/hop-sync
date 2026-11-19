@@ -62,6 +62,18 @@ class SessionPool:
         slots = self._exec_slots.setdefault(alias, asyncio.Semaphore(EXEC_SLOTS))
         return Endpoint(alias, conn, sftp, exec_slots=slots)
 
+    def status(self, alias: str) -> tuple[bool, str | None]:
+        """(is connected, remembered login problem: "auth", "passphrase" or None)."""
+        cached = self._endpoints.get(alias)
+        connected = cached is not None and not cached.conn.is_closed()
+        error = self._auth_errors.get(alias)
+        kind = None
+        if isinstance(error, KeyNeedsPassphrase):
+            kind = "passphrase"
+        elif error is not None:
+            kind = "auth"
+        return connected, kind
+
     def invalidate(self, alias: str, only_if: Endpoint | None = None) -> None:
         """Drop a connection known to be bad (the next get() reconnects).
 
