@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hopsync"
+version = "0.1.0"
+description = "Relay files between two SFTP hosts through this computer"
+requires-python = ">=3.11"
+dependencies = ["asyncssh"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+hopsync = "hopsync.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hopsync"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = '-m "not slow"'
+markers = [
+    "slow: large transfers, skipped by default",
+    "integration: needs docker test hosts",
+]

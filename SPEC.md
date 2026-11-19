@@ -46,7 +46,7 @@ Key rule: `core` emits progress as events (callback or asyncio queue). The CLI, 
 - Throughput: confirm asyncssh keeps several SFTP requests in flight per read/write (`block_size` / `max_requests`). Sequential single requests are limited by network latency. Measure throughput and record it.
 - Destination path rules work like `cp`: if the destination is an existing directory, copy into it under the source name; otherwise the destination is the new file name. The parent directory must exist.
 - Copying between two paths on the same host is refused with a clear error. Relaying through this computer would be pointless.
-- Acceptance: a generated 1 GB file copies with correct size, and process RSS stays under 100 MB throughout.
+- Acceptance: a generated 1 GB file copies with correct size, and process RSS grows by less than 50 MB over its pre-copy baseline (buffer budget is 16 MB).
 
 ### 2a. Resume and verify
 - Write to a temporary `<name>.hopsync-part` file and rename it to the final name only after verification passes. A half-written file must never look complete.

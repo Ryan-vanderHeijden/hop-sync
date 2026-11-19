@@ -1,0 +1,25 @@
+# Two throwaway sshd hosts for tests. Ports bind to 127.0.0.1 only.
+# .hostdata/ is created by conftest.py (client key lives there).
+x-host: &host
+  build: ./docker
+  volumes:
+    - ./.hostdata/client_key.pub:/authorized_keys_src:ro
+  healthcheck:
+    test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+    interval: 1s
+    timeout: 2s
+    retries: 30
+
+services:
+  server:  # stands in for the home server: key only
+    <<: *host
+    environment:
+      SSHD_CONFIG: /etc/ssh/sshd_key_only.conf
+    ports:
+      - "127.0.0.1:2222:22"
+  hpc:  # stands in for the HPC: key AND password
+    <<: *host
+    environment:
+      SSHD_CONFIG: /etc/ssh/sshd_key_and_password.conf
+    ports:
+      - "127.0.0.1:2223:22"
