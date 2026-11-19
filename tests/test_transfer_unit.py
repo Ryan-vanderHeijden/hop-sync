@@ -8,102 +8,12 @@ from types import SimpleNamespace
 import asyncssh
 import pytest
 
+from fakes import FakeFile, FakeSFTP, endpoints
+
 from hopsync.core import resume
 from hopsync.core.errors import VerificationFailed
 from hopsync.core.events import TransferFinished, TransferProgress, TransferStarted, Verifying
-from hopsync.core.session import Endpoint
 from hopsync.core.transfer import TransferError, copy_file, resolve_destination
-
-
-class FakeFile:
-    def __init__(self, data=b"", fail_after=None):
-        self.data = bytearray(data)
-        self.pos = 0
-        self.fail_after = fail_after  # raise after this many calls
-        self.calls = 0
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    def _maybe_fail(self):
-        self.calls += 1
-        if self.fail_after is not None and self.calls > self.fail_after:
-            raise RuntimeError("boom")
-
-    async def seek(self, offset):
-        self.pos = offset
-
-    async def read(self, n=-1):
-        self._maybe_fail()
-        await asyncio.sleep(0)
-        end = len(self.data) if n < 0 else self.pos + n
-        chunk = bytes(self.data[self.pos : end])
-        self.pos += len(chunk)
-        return chunk
-
-    async def write(self, chunk, offset):
-        self._maybe_fail()
-        await asyncio.sleep(0)
-        assert offset <= len(self.data)  # never skips ahead
-        self.data[offset : offset + len(chunk)] = chunk  # overwrites like a real file
-
-
-class FakeSFTP:
-    """files: path -> FakeFile; dirs: set of directory paths."""
-
-    def __init__(self, files=None, dirs=(), size_lie=0):
-        self.files = files or {}
-        self.dirs = set(dirs) | {"."}
-        self.size_lie = size_lie
-
-    def open(self, path, mode):
-        if mode == "wb":  # truncate (keep the object so fail_after survives)
-            existing = self.files.setdefault(path, FakeFile())
-            existing.data = bytearray()
-        if path not in self.files:
-            raise asyncssh.SFTPNoSuchFile("no such file")
-        return self.files[path]
-
-    async def stat(self, path):
-        if path in self.dirs:
-            return SimpleNamespace(permissions=stat.S_IFDIR | 0o755, size=0, mtime=0)
-        if path in self.files:
-            size = len(self.files[path].data) + (self.size_lie if path.endswith(".hopsync-part") else 0)
-            return SimpleNamespace(permissions=stat.S_IFREG | 0o644, size=size, mtime=100)
-        raise asyncssh.SFTPNoSuchFile("no such file")
-
-    async def posix_rename(self, old, new):
-        self.files[new] = self.files.pop(old)
-
-    async def remove(self, path):
-        if path not in self.files:
-            raise asyncssh.SFTPNoSuchFile("no such file")
-        del self.files[path]
-
-
-class FakeConn:
-    """Pretends to run sha256sum over the fake files of one SFTP."""
-
-    def __init__(self, sftp, lie=False):
-        self.sftp, self.lie = sftp, lie
-
-    async def run(self, command, check=False):
-        path = command.split("-- ", 1)[1].strip("'")
-        digest = hashlib.sha256(bytes(self.sftp.files[path].data)).hexdigest()
-        if self.lie:
-            digest = "0" * 64
-        return SimpleNamespace(exit_status=0, stdout=f"{digest}  {path}\n", stderr="")
-
-
-def endpoints(src_files, dst_files=None, *, lie=False, **dst_kwargs):
-    src_sftp = FakeSFTP(src_files)
-    dst_sftp = FakeSFTP(dst_files, **dst_kwargs)
-    src = Endpoint("hpc", FakeConn(src_sftp), src_sftp)
-    dst = Endpoint("server", FakeConn(dst_sftp, lie), dst_sftp)
-    return src, dst
 
 
 PART = "b.hopsync-part"

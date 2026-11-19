@@ -15,10 +15,10 @@ from .events import TransferFinished, TransferProgress, TransferStarted, Verifyi
 from .session import Endpoint
 from .verify import remote_sha256
 
-__all__ = ["TransferError", "copy_file", "resolve_destination"]
+__all__ = ["TransferError", "apply_metadata", "copy_file", "resolve_destination", "stat_or_none"]
 
 
-async def _stat_or_none(sftp, path: str):
+async def stat_or_none(sftp, path: str):
     """Return attributes for a path, or None if it does not exist."""
     try:
         return await sftp.stat(path)
@@ -28,15 +28,25 @@ async def _stat_or_none(sftp, path: str):
 
 async def resolve_destination(dst_sftp, src_path: str, dst_path: str) -> str:
     """Apply the cp rule: an existing directory receives the file inside it."""
-    attrs = await _stat_or_none(dst_sftp, dst_path)
+    attrs = await stat_or_none(dst_sftp, dst_path)
     if attrs is not None and stat.S_ISDIR(attrs.permissions or 0):
+        if posixpath.basename(src_path) in ("", ".", ".."):
+            raise TransferError("cannot tell the source's name; give the destination an explicit name")
         return posixpath.join(dst_path, posixpath.basename(src_path))
 
     parent = posixpath.dirname(dst_path) or "."
-    parent_attrs = await _stat_or_none(dst_sftp, parent)
+    parent_attrs = await stat_or_none(dst_sftp, parent)
     if parent_attrs is None or not stat.S_ISDIR(parent_attrs.permissions or 0):
         raise TransferError(f"destination directory '{parent}' does not exist")
     return dst_path
+
+
+async def apply_metadata(sftp, path: str, mode: int, mtime: int) -> None:
+    """Set permission bits and times on a remote file or directory."""
+    # `& 0o777` keeps only rwx bits: setuid/setgid/sticky are dropped on
+    # purpose. Ownership is never touched. atime is set equal to mtime.
+    attrs = asyncssh.SFTPAttrs(permissions=mode & 0o777, atime=mtime, mtime=mtime)
+    await sftp.setstat(path, attrs)
 
 
 async def _read_chunks(src_file, queue: asyncio.Queue, chunk_size: int) -> None:
@@ -159,23 +169,24 @@ async def copy_file(
         raise TransferError(f"'{src_path}' is not a regular file")
     total = src_attrs.size or 0
 
-    meta = resume.make_meta(src.alias, src_path, total, src_attrs.mtime or 0)
-    offset = await _prepare_part(dst, dst_path, meta, chunk_size)
+    # Open the source FIRST: if it cannot be read (e.g. permission denied),
+    # we fail before anything has been written on the destination.
+    async with src.sftp.open(src_path, "rb") as src_file:
+        meta = resume.make_meta(src.alias, src_path, total, src_attrs.mtime or 0)
+        offset = await _prepare_part(dst, dst_path, meta, chunk_size)
 
-    started = time.monotonic()
-    on_event(TransferStarted(src_path, dst_path, total, resumed_from=offset))
+        started = time.monotonic()
+        on_event(TransferStarted(src_path, dst_path, total, resumed_from=offset))
 
-    def report(done: int) -> None:
-        on_event(TransferProgress(src_path, dst_path, done, total))
+        def report(done: int) -> None:
+            on_event(TransferProgress(src_path, dst_path, done, total))
 
-    # Only a fresh transfer can hash while streaming (see _verify).
-    hasher = hashlib.sha256() if verify and offset == 0 else None
-    mode = "r+b" if offset > 0 else "wb"  # r+b keeps the existing bytes
-    async with src.sftp.open(src_path, "rb") as src_file, dst.sftp.open(
-        resume.part_path(dst_path), mode
-    ) as dst_file:
-        await src_file.seek(offset)
-        await _stream(src_file, dst_file, offset, report, hasher, chunk_size, queue_depth)
+        # Only a fresh transfer can hash while streaming (see _verify).
+        hasher = hashlib.sha256() if verify and offset == 0 else None
+        mode = "r+b" if offset > 0 else "wb"  # r+b keeps the existing bytes
+        async with dst.sftp.open(resume.part_path(dst_path), mode) as dst_file:
+            await src_file.seek(offset)
+            await _stream(src_file, dst_file, offset, report, hasher, chunk_size, queue_depth)
 
     try:
         await _verify(src, src_path, dst, dst_path, total, offset, verify, hasher, on_event)
@@ -185,5 +196,6 @@ async def copy_file(
         raise VerificationFailed(f"{error}; partial file removed, rerun to copy again") from None
 
     await _finish(dst, dst_path)
+    await apply_metadata(dst.sftp, dst_path, src_attrs.permissions or 0o644, src_attrs.mtime or 0)
     on_event(TransferFinished(src_path, dst_path, total, time.monotonic() - started))
     return total

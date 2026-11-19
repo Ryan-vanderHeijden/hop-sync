@@ -32,3 +32,28 @@ class Verifying:
     src: str
     dst: str
     method: str  # "size" or "sha256"
+
+
+@dataclass(frozen=True)
+class TreeProgress:
+    """Overall progress of a directory copy. The totals grow while the walk runs."""
+
+    src: str
+    dst: str
+    files_done: int
+    files_found: int
+    bytes_done: int
+    bytes_found: int
+    walk_complete: bool  # True once the totals are final
+
+
+@dataclass(frozen=True)
+class EntrySkipped:
+    path: str
+    reason: str  # symlink, special file, non-UTF-8 name, already copied, hopsync temp file
+
+
+@dataclass(frozen=True)
+class EntryFailed:
+    path: str
+    message: str

@@ -3,17 +3,27 @@
 import argparse
 import asyncio
 import getpass
+import stat
 import sys
 import time
 from datetime import datetime
 
 import asyncssh
 
-from .core.events import TransferFinished, TransferProgress, TransferStarted, Verifying
+from .core.events import (
+    EntryFailed,
+    EntrySkipped,
+    TransferFinished,
+    TransferProgress,
+    TransferStarted,
+    TreeProgress,
+    Verifying,
+)
 from .core.listing import list_dir
 from .core.paths import parse_remote
 from .core.session import ConnectError, Endpoint, KeyNeedsPassphrase, connect
 from .core.transfer import TransferError, copy_file, resolve_destination
+from .core.tree import copy_tree
 
 
 def human_size(num: float) -> str:
@@ -69,11 +79,85 @@ class ProgressBar:
         sys.stderr.flush()
 
 
+class TreeBar:
+    """Overall progress line for a directory copy, plus one line per entry."""
+
+    def __init__(self) -> None:
+        self.start = time.monotonic()
+        self.last_draw = 0.0
+        self.tree = None  # latest TreeProgress
+        self.current = 0  # bytes of the file being copied right now
+        self.last_file = 0
+        self.moved = 0  # bytes sent in this run (skipped/resumed bytes excluded)
+
+    def __call__(self, event) -> None:
+        if isinstance(event, TransferStarted):
+            self.current = self.last_file = event.resumed_from
+        elif isinstance(event, TransferProgress):
+            self.moved += event.bytes_done - self.last_file
+            self.current = self.last_file = event.bytes_done
+            self.draw()
+        elif isinstance(event, TransferFinished):
+            self.current = 0
+            self.print_line(f"copied  {event.src} ({human_size(event.bytes_done)})")
+        elif isinstance(event, TreeProgress):
+            self.tree = event
+            self.draw(force=event.walk_complete)
+        elif isinstance(event, EntrySkipped):
+            self.print_line(f"skipped {event.path} ({event.reason})")
+        elif isinstance(event, EntryFailed):
+            self.current = 0
+            self.print_line(f"FAILED  {event.path}: {event.message}")
+
+    def print_line(self, text: str) -> None:
+        """Print a line without leaving a half-drawn progress line behind."""
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 78 + "\r")
+        print(text, file=sys.stderr)
+        self.last_draw = 0.0  # redraw the bar on the next event
+
+    def draw(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if self.tree is None or (not force and now - self.last_draw < 0.1):
+            return
+        self.last_draw = now
+        t = self.tree
+        done = t.bytes_done + self.current
+        elapsed = now - self.start
+        rate = self.moved / elapsed if elapsed > 0 else 0
+        percent = 100 * done / t.bytes_found if t.bytes_found else 100
+        plus = "" if t.walk_complete else "+"  # "+" = the total may still grow
+        eta = "--:--"
+        if t.walk_complete and rate > 0:
+            eta = format_eta((t.bytes_found - done) / rate)
+        line = (
+            f"{percent:5.1f}%  {human_size(done)}/{human_size(t.bytes_found)}{plus}  "
+            f"{t.files_done}/{t.files_found}{plus} files  {rate / 1e6:.1f} MB/s  ETA {eta}"
+        )
+        sys.stderr.write("\r" + line.ljust(78))
+        sys.stderr.flush()
+
+    def clear(self) -> None:
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 78 + "\r")
+
+
 def print_summary(event: TransferFinished, resumed_from: int) -> None:
     """Final line: total size, time and average throughput of this run."""
     moved = event.bytes_done - resumed_from
     rate = moved / event.seconds / 1e6 if event.seconds > 0 else 0
     print(f"copied {human_size(event.bytes_done)} in {event.seconds:.1f}s ({rate:.1f} MB/s average)")
+
+
+def print_tree_summary(result, seconds: float) -> None:
+    """Final lines for a directory copy; failures are listed again here."""
+    rate = result.bytes_copied / seconds / 1e6 if seconds > 0 else 0
+    print(
+        f"{result.copied} copied, {result.skipped} skipped, {result.failed} failed; "
+        f"{human_size(result.bytes_copied)} in {seconds:.1f}s ({rate:.1f} MB/s average)"
+    )
+    for path, message in result.failures:
+        print(f"  failed: {path}: {message}", file=sys.stderr)
 
 
 async def open_connection(alias: str, args, passwords: dict):
@@ -108,7 +192,8 @@ async def run_list(args) -> None:
         await conn.wait_closed()
 
 
-async def run_copy(args) -> None:
+async def run_copy(args) -> int:
+    """Copy a file or directory. Returns the exit code."""
     src, dst = parse_remote(args.src), parse_remote(args.dst)
     if src.host == dst.host:
         raise TransferError("source and destination are on the same host; copy on the host itself")
@@ -123,21 +208,40 @@ async def run_copy(args) -> None:
             src_end = Endpoint(src.host, src_conn, src_sftp)
             dst_end = Endpoint(dst.host, dst_conn, dst_sftp)
             dst_path = await resolve_destination(dst_sftp, src.path, dst.path)
-            bar = ProgressBar()
-            finished = []
-
-            def on_event(event) -> None:
-                bar(event)
-                if isinstance(event, TransferFinished):
-                    finished.append(event)
-
-            await copy_file(src_end, src.path, dst_end, dst_path, on_event, verify=args.verify)
-            bar.clear()
-            print_summary(finished[0], bar.resumed_from)
+            src_attrs = await src_sftp.stat(src.path)
+            if stat.S_ISDIR(src_attrs.permissions or 0):
+                return await copy_directory(args, src_end, src.path, dst_end, dst_path)
+            return await copy_single_file(args, src_end, src.path, dst_end, dst_path)
     finally:
         for conn in connections:
             conn.close()
             await conn.wait_closed()
+
+
+async def copy_single_file(args, src_end, src_path, dst_end, dst_path) -> int:
+    bar = ProgressBar()
+    finished = []
+
+    def on_event(event) -> None:
+        bar(event)
+        if isinstance(event, TransferFinished):
+            finished.append(event)
+
+    await copy_file(src_end, src_path, dst_end, dst_path, on_event, verify=args.verify)
+    bar.clear()
+    print_summary(finished[0], bar.resumed_from)
+    return 0
+
+
+async def copy_directory(args, src_end, src_path, dst_end, dst_path) -> int:
+    bar = TreeBar()
+    started = time.monotonic()
+    result = await copy_tree(
+        src_end, src_path, dst_end, dst_path, bar, links=args.links, verify=args.verify
+    )
+    bar.clear()
+    print_tree_summary(result, time.monotonic() - started)
+    return 1 if result.failed else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -153,6 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     copy_cmd = sub.add_parser("copy", help="copy one file between hosts")
     copy_cmd.add_argument("src", metavar="SRC_ALIAS:PATH")
     copy_cmd.add_argument("dst", metavar="DST_ALIAS:PATH")
+    copy_cmd.add_argument("--links", action="store_true", help="copy symlinks as links (directories only)")
     copy_cmd.add_argument("--verify", action="store_true", help="also compare sha256 checksums")
     return parser
 
@@ -161,7 +266,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     runner = run_list if args.command == "list" else run_copy
     try:
-        asyncio.run(runner(args))
+        return asyncio.run(runner(args)) or 0
     except KeyboardInterrupt:
         print("\ninterrupted" + KEPT_HINT.get(args.command, ""), file=sys.stderr)
         return 130
@@ -171,7 +276,6 @@ def main(argv=None) -> int:
         return fail(f"SFTP error: {exc.reason}")
     except (asyncssh.Error, OSError) as exc:
         return fail(f"connection problem: {exc}" + KEPT_HINT.get(args.command, ""))
-    return 0
 
 
 KEPT_HINT = {"copy": "; partial file kept; run the same command again to resume"}
