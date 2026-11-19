@@ -28,10 +28,34 @@ class SecurityMiddleware:
         self.hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
         self.origins = {f"http://{host}" for host in self.hosts}
         self.session_secret = session_secret
+        self.response_headers = self.build_response_headers(port)
+
+    @staticmethod
+    def build_response_headers(port: int) -> list:
+        """Headers added to EVERY http response (ours and the ones we refuse with)."""
+        csp = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            f"connect-src 'self' ws://127.0.0.1:{port} ws://localhost:{port}; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        )
+        return [
+            (b"content-security-policy", csp.encode()),
+            (b"x-frame-options", b"DENY"),  # another site cannot frame the UI to trick a drag
+            (b"x-content-type-options", b"nosniff"),
+            (b"referrer-policy", b"no-referrer"),  # the /auth URL holds the token
+        ]
+
+    def with_security_headers(self, send):
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []), *self.response_headers]}
+            await send(message)
+
+        return send_with_headers
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            await self.check_http(scope, receive, send)
+            await self.check_http(scope, receive, self.with_security_headers(send))
         elif scope["type"] == "websocket":
             await self.check_websocket(scope, receive, send)
         else:

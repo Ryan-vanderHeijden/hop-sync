@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import mimetypes
 from pathlib import Path
 
 import asyncssh
@@ -22,6 +23,16 @@ from ..core.sessions import SessionPool
 from .hub import EventHub
 from .security import COOKIE_NAME, SecurityMiddleware, same_secret
 from .serialize import job_to_json
+
+# Python reads content types from the Windows registry, where .js is often
+# "text/plain". Browsers refuse to load ES modules with that type, so we set
+# the types ourselves before any static file is served.
+def register_mime_types() -> None:
+    mimetypes.add_type("text/javascript", ".js")
+    mimetypes.add_type("text/css", ".css")
+
+
+register_mime_types()
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 MAX_PATH_LENGTH = 4096
@@ -71,6 +82,7 @@ def create_app(
     hub: EventHub,
 ) -> FastAPI:
     """Build the app. `hub` must be the same hub the manager publishes to."""
+    register_mime_types()  # again: something may have changed the table since import
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     # No CORS middleware, on purpose: without it browsers refuse to let other
     # websites read our responses. Do not add one "to make something work".

@@ -1,0 +1,160 @@
+// Smoke tests for pane.js and jobs.js using a tiny fake DOM (see fakedom.mjs).
+// Run with: node --test tests/web/ui.test.mjs
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { FakeElement, installFakeDom } from "./fakedom.mjs";
+
+installFakeDom();
+
+const listing = {
+  host: "hpc",
+  path: ".",
+  abs_path: "/home/me",
+  entries: [
+    { name: "adir", size: 0, mtime: 1700000000, is_dir: true, is_link: false },
+    { name: "<b>evil</b>.txt", size: 2048, mtime: 1700000000, is_dir: false, is_link: false },
+    { name: "other.bin", size: 5, mtime: 1700000000, is_dir: false, is_link: false },
+  ],
+};
+
+let requests = [];
+globalThis.fetch = async (url) => {
+  requests.push(String(url));
+  return { ok: true, status: 200, json: async () => listing };
+};
+
+const { Pane, DRAG_TYPE } = await import("../../hopsync/web/pane.js");
+const { JobsPanel } = await import("../../hopsync/web/jobs.js");
+
+function makePane() {
+  const calls = { dropped: [], loaded: 0 };
+  const pane = new Pane(new FakeElement("section"), "left", {
+    onLoaded: () => { calls.loaded += 1; },
+    onDrop: (payload, target, directory) => calls.dropped.push({ payload, directory }),
+  });
+  pane.setHosts([{ alias: "hpc", connected: true, error_kind: null }, { alias: "server", connected: false, error_kind: null }]);
+  return { pane, calls };
+}
+
+const rowsOf = (pane) => pane.rows();
+
+test("pane lists a directory and shows names as plain text", async () => {
+  const { pane, calls } = makePane();
+  await pane.load("hpc", "");
+  assert.match(requests.at(-1), /^\/api\/list\?host=hpc&path=$/);
+  assert.equal(rowsOf(pane).length, 3);
+  assert.equal(pane.pathInput.value, "/home/me");
+  assert.ok(pane.list.textContent.includes("<b>evil</b>.txt")); // kept as text, never HTML
+  assert.equal(calls.loaded, 1);
+  assert.equal(pane.dot.className, "dot connected");
+});
+
+test("selection: click, ctrl+click, shift+click, ctrl+a, keys", async () => {
+  const { pane } = makePane();
+  await pane.load("hpc", "");
+  const click = (i, mods = {}) => rowsOf(pane)[i].dispatch("click", { ...mods });
+  click(1);
+  assert.deepEqual([...pane.selected], [1]);
+  click(2, { ctrlKey: true });
+  assert.deepEqual([...pane.selected].sort(), [1, 2]);
+  click(0, { shiftKey: true }); // the range starts at the last ctrl+click (row 2)
+  assert.deepEqual([...pane.selected].sort(), [0, 1, 2]);
+  pane.list.dispatch("keydown", { key: "a", ctrlKey: true });
+  assert.equal(pane.selected.size, 3);
+  pane.list.dispatch("keydown", { key: "ArrowDown" });
+  assert.equal(pane.selected.size, 1);
+  assert.deepEqual(pane.selectedPaths(), ["/home/me/<b>evil</b>.txt"]); // the cursor was on row 0
+});
+
+test("double click opens a directory; Backspace goes up", async () => {
+  const { pane } = makePane();
+  await pane.load("hpc", "");
+  rowsOf(pane)[0].dispatch("dblclick");
+  await new Promise((r) => setImmediate(r));
+  assert.match(requests.at(-1), /path=%2Fhome%2Fme%2Fadir/);
+  pane.list.dispatch("keydown", { key: "Backspace" });
+  // (the fake server always answers /home/me, so "up" is /home)
+  assert.match(requests.at(-1), /path=%2Fhome$/);
+});
+
+test("a newer listing makes an older one irrelevant", async () => {
+  const { pane } = makePane();
+  const slow = pane.load("hpc", "first");
+  await pane.load("hpc", "second");
+  await slow;
+  assert.equal(pane.requestId, 2);
+});
+
+test("dragging starts with the selection and drops on the other pane", async () => {
+  const left = makePane();
+  const right = makePane();
+  await left.pane.load("hpc", "");
+  await right.pane.load("server", "");
+  const stored = {};
+  const dataTransfer = { types: [DRAG_TYPE], setData: (t, v) => { stored[t] = v; }, getData: (t) => stored[t] };
+  // an unselected row drags just itself
+  rowsOf(left.pane)[2].dispatch("dragstart", { dataTransfer });
+  assert.deepEqual(JSON.parse(stored[DRAG_TYPE]), { host: "hpc", paths: ["/home/me/other.bin"] });
+  // dropping on the source pane does nothing
+  left.pane.root.dispatch("drop", { dataTransfer });
+  assert.equal(left.calls.dropped.length, 0);
+  // dropping on a directory row of the other pane targets that directory
+  rowsOf(right.pane)[0].dispatch("dragover", { dataTransfer });
+  assert.ok(rowsOf(right.pane)[0].classList.contains("drop-row"));
+  rowsOf(right.pane)[0].dispatch("drop", { dataTransfer });
+  assert.equal(right.calls.dropped[0].directory, "/home/me/adir");
+  // dropping on empty space targets the current directory
+  right.pane.root.dispatch("drop", { dataTransfer, target: right.pane.list });
+  assert.equal(right.calls.dropped[1].directory, "/home/me");
+});
+
+function job(overrides = {}) {
+  return {
+    id: "abc12345", src: { host: "hpc", path: "/data/x" }, dst: { host: "server", path: "/out" },
+    options: {}, state: "running", bytes_done: 500, bytes_total: 1000, bytes_transferred: 500,
+    files_done: 0, files_found: 1, walk_complete: false, current_file: "/data/x/file<1>",
+    message: "", error_kind: null, error_alias: null, attempt: 1, ...overrides,
+  };
+}
+
+test("jobs panel shows progress, a growing total, entries and buttons", () => {
+  const finished = [];
+  const actions = [];
+  const panel = new JobsPanel(new FakeElement("section"), {
+    onCancel: (id) => actions.push(["cancel", id]),
+    onRetry: (id) => actions.push(["retry", id]),
+    onJobFinished: (j) => finished.push(j.state),
+  });
+  panel.handleMessage({ type: "snapshot", jobs: [job()] });
+  let text = panel.body.textContent;
+  assert.ok(text.includes("hpc:/data/x -> server:/out"));
+  assert.ok(text.includes("500 B / 1000 B+")); // "+" while the walk is not complete
+  assert.ok(text.includes("/data/x/file<1>"));
+
+  panel.handleMessage({ type: "entry", job_id: "abc12345", kind: "skipped", path: "a", reason: "already copied" });
+  panel.handleMessage({ type: "entry", job_id: "abc12345", kind: "failed", path: "b.txt", reason: "denied" });
+  text = panel.body.textContent;
+  assert.ok(text.includes("1 skipped") && text.includes("1 failed"));
+
+  const buttons = () => panel.body.all().filter((n) => n.tagName === "BUTTON");
+  buttons().find((b) => b.textContent === "Cancel").dispatch("click");
+  buttons().find((b) => b.textContent === "1 failed").dispatch("click");
+  assert.ok(panel.body.textContent.includes("b.txt: denied"));
+
+  panel.handleMessage({ type: "job", job: job({ state: "failed", message: "1 entries failed", walk_complete: true }) });
+  assert.deepEqual(finished, ["failed"]);
+  buttons().find((b) => b.textContent === "Retry").dispatch("click");
+  assert.deepEqual(actions, [["cancel", "abc12345"], ["retry", "abc12345"]]);
+
+  panel.handleMessage({ type: "job", job: job({ id: "done0001", state: "done", walk_complete: true }) });
+  panel.clearButton.dispatch("click");
+  assert.ok(!panel.body.textContent.includes("done0001"));
+  assert.ok(panel.body.textContent.includes("abc12345"));
+});
+
+test("jobs panel: ETA only for a running job with a complete walk and known speed", () => {
+  const panel = new JobsPanel(new FakeElement("section"), { onCancel() {}, onRetry() {}, onJobFinished() {} });
+  panel.handleMessage({ type: "snapshot", jobs: [job({ walk_complete: true, bytes_transferred: 0 })] });
+  assert.ok(!panel.body.textContent.includes("ETA"));
+});

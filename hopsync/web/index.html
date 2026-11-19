@@ -1,32 +1,29 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>hopsync</title>
+  <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <h1>hopsync</h1>
-  <p id="status">connecting...</p>
-  <pre id="jobs"></pre>
-  <script>
-    // Placeholder page: shows the jobs JSON as it changes.
-    const jobs = {};
-    const out = document.getElementById("jobs");
-    const status = document.getElementById("status");
-    function show() { out.textContent = JSON.stringify(Object.values(jobs), null, 2); }
-    const socket = new WebSocket("ws://" + location.host + "/api/events");
-    socket.onopen = () => { status.textContent = "connected"; };
-    socket.onclose = () => { status.textContent = "disconnected (reload to reconnect)"; };
-    socket.onmessage = (message) => {
-      const data = JSON.parse(message.data);
-      if (data.type === "snapshot") {
-        for (const key in jobs) delete jobs[key];
-        data.jobs.forEach((job) => { jobs[job.id] = job; });
-      } else if (data.type === "job") {
-        jobs[data.job.id] = data.job;
-      }
-      show();
-    };
-  </script>
+  <div id="banner" class="banner" hidden>Session ended. Open the new link printed in the terminal.</div>
+
+  <header class="topbar">
+    <strong class="app-name">hopsync</strong>
+    <label><input type="checkbox" id="opt-verify" autocomplete="off"> Verify (sha256)</label>
+    <label><input type="checkbox" id="opt-links" autocomplete="off"> Copy symlinks as links</label>
+    <label class="warning"><input type="checkbox" id="opt-overwrite" autocomplete="off"> Overwrite existing files</label>
+  </header>
+
+  <main class="panes">
+    <section id="pane-left"></section>
+    <section id="pane-right"></section>
+  </main>
+
+  <section id="jobs" class="jobs"></section>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <script type="module" src="/app.js"></script>
 </body>
 </html>
