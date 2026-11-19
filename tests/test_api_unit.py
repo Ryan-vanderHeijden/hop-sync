@@ -272,10 +272,10 @@ def test_validation_errors_are_400(signed_in):
 
 
 def test_job_crud_cancel_retry(signed_in):
-    created = signed_in.post("/api/jobs", json={**JOB, "verify": True, "overwrite": True})
+    created = signed_in.post("/api/jobs", json={**JOB, "verify": True, "on_conflict": "overwrite"})
     assert created.status_code == 201
     job = created.json()
-    assert job["options"] == {"verify": True, "links": False, "overwrite": True}
+    assert job["options"] == {"verify": True, "links": False, "on_conflict": "overwrite"}
     assert job["src"] == {"host": "hpc", "path": "data/x"}
 
     assert [j["id"] for j in signed_in.get("/api/jobs").json()] == [job["id"]]
@@ -310,11 +310,14 @@ def test_error_mapping(signed_in):
         return signed_in.get("/api/list", params={"host": host, "path": path})
 
     assert get("hpc", "missing").status_code == 404 and get("hpc", "missing").json()["error"] == "not_found"
+    assert get("hpc", "missing").json()["message"] == "not found: missing on hpc"
+    assert get("hpc", "denied").json()["message"] == "permission denied: denied on hpc"
+    assert get("down").json()["message"].startswith("cannot reach down")
     assert get("hpc", "denied").status_code == 403 and get("hpc", "denied").json()["error"] == "permission_denied"
     for host in ("locked", "needpass"):
         response = get(host)
         assert response.status_code == 502 and response.json()["error"] == "auth"
-        assert response.json()["message"] == f"restart hopsync with --password-for {host}"
+        assert response.json()["message"].endswith(f"restart hopsync with --password-for {host}")
     assert get("badkey").status_code == 502 and get("badkey").json()["error"] == "hostkey"
     assert get("down").status_code == 502 and get("down").json()["error"] == "connection"
 

@@ -12,7 +12,9 @@ from . import resume
 from .errors import ConflictError, TransferError
 from .events import EntryFailed, EntrySkipped, TreeProgress
 from .session import Endpoint
-from .transfer import apply_metadata, check_destination, copy_file, stat_or_none
+from .conflict import ConflictInfo, get_resolver
+from .explain import explain
+from .transfer import apply_metadata, copy_file, find_free_name, lstat_or_none, plan_destination, stat_or_none
 
 # How many discovered files may wait for the copier. Bounded so a huge
 # tree cannot fill memory while the (fast) walk runs ahead of the (slow) copy.
@@ -49,7 +51,7 @@ class _Dir:
     path: str
     mode: int  # the source directory's mode
     mtime: int
-    apply_source: bool  # set mode+mtime from the source? (only if we created it, or --overwrite)
+    apply_source: bool  # set mode+mtime from the source? (only if we created it, or on_conflict is "overwrite")
     restore_mode: int | None  # original mode, if we had to make it writable
 
 
@@ -63,7 +65,7 @@ class _State:
     dst_root: str
     on_event: Callable
     links: bool
-    overwrite: bool
+    on_conflict: object  # a policy name, or the job's resolver function
     created_dirs: set
     result: TreeResult
     queue: asyncio.Queue
@@ -127,12 +129,12 @@ async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> boo
 
     Returns True if this call created the directory."""
     # Directories that already existed are left exactly as found: we only
-    # set mode/mtime on directories we created (or when --overwrite is given).
+    # set mode/mtime on directories we created (or when the policy is "overwrite").
     # `created_dirs` remembers directories made earlier by the SAME job (an
     # automatic or manual retry), so they still count as ours. Trade-off: after
     # an interrupted run of the command line tool, a rerun is a new job, so
     # directories made by the first run count as "existing" and keep their
-    # default mode/mtime unless the rerun uses --overwrite.
+    # default mode/mtime unless the rerun uses --on-conflict overwrite.
     attrs = await stat_or_none(state.dst.sftp, dst_dir)
     restore_mode = None
     created_now = attrs is None
@@ -149,7 +151,8 @@ async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> boo
             # files, and remember the original mode to put back at the end.
             restore_mode = attrs.permissions & 0o7777
             await state.dst.sftp.chmod(dst_dir, restore_mode | 0o700)
-    state.dirs.append(_Dir(dst_dir, mode, mtime, created or state.overwrite, restore_mode))
+    # Existing directories get the source's metadata only under "overwrite".
+    state.dirs.append(_Dir(dst_dir, mode, mtime, created or state.on_conflict == "overwrite", restore_mode))
     return created_now
 
 
@@ -241,46 +244,46 @@ async def _walker(state: _State, src_attrs) -> None:
     await state.queue.put(None)  # tells the copier there is nothing more
 
 
-async def _make_link(state: _State, job: _Job) -> bool:
-    """Create a symlink on the destination. Returns False if it was already there."""
+async def _make_link(state: _State, job: _Job) -> str:
+    """Create a symlink on the destination. Returns "created", "already" or "skipped"."""
     sftp = state.dst.sftp
-    existing = await stat_or_none_lstat(sftp, job.dst_path)
+    path = job.dst_path
+    existing = await lstat_or_none(sftp, path)
     if existing is not None:
-        is_link = stat.S_ISLNK(existing.permissions or 0)
-        if is_link and await sftp.readlink(job.dst_path) == job.link_target:
-            return False
-        if not state.overwrite:
-            raise ConflictError(job.dst_path)
-        if stat.S_ISDIR(existing.permissions or 0):
-            raise TransferError(f"'{job.dst_path}' is a directory; not replacing it")
-        await sftp.remove(job.dst_path)
+        if stat.S_ISLNK(existing.permissions or 0) and await sftp.readlink(path) == job.link_target:
+            return "already"
+        info = ConflictInfo(path, stat.S_ISDIR(existing.permissions or 0), 0, 0, 0, 0)
+        decision = await get_resolver(state.on_conflict)(info)
+        if decision == "skip":
+            return "skipped"
+        if decision == "rename":
+            path, _ = await find_free_name(sftp, path, -1, -1)
+        elif info.is_dir_at_dst:
+            raise TransferError(f"'{path}' is a directory; not replacing it")
+        else:
+            await sftp.remove(path)
     # asyncssh's symlink() takes (target, link_path) like os.symlink and
     # fixes the argument order that OpenSSH uses on the wire by itself.
-    await sftp.symlink(job.link_target, job.dst_path)
-    return True
-
-
-async def stat_or_none_lstat(sftp, path: str):
-    """Like stat_or_none but does not follow links."""
-    try:
-        return await sftp.lstat(path)
-    except asyncssh.SFTPNoSuchFile:
-        return None
+    await sftp.symlink(job.link_target, path)
+    return "created"
 
 
 async def _copy_one(state: _State, job: _Job, copy_args: dict) -> None:
     """Copy (or skip) one job, updating the counters."""
     if job.link_target is not None:
-        if await _make_link(state, job):
+        outcome = await _make_link(state, job)
+        if outcome == "created":
             state.result.copied += 1
         else:
-            state.skip(job.src_path, "already copied")
-    elif await check_destination(state.dst.sftp, job.dst_path, job.size, job.mtime, state.overwrite):
-        state.skip(job.src_path, "already copied")
-    else:
-        await copy_file(state.src, job.src_path, state.dst, job.dst_path, state.on_event, **copy_args)
-        state.result.copied += 1
-        state.result.bytes_copied += job.size
+            state.skip(job.src_path, "already copied" if outcome == "already" else "exists, skipped")
+        return
+    plan = await plan_destination(state.dst.sftp, job.dst_path, job.size, job.mtime, state.on_conflict)
+    if plan.action != "copy":
+        state.skip(job.src_path, "already copied" if plan.action == "identical" else "exists, skipped")
+        return
+    await copy_file(state.src, job.src_path, state.dst, job.dst_path, state.on_event, plan=plan, **copy_args)
+    state.result.copied += 1
+    state.result.bytes_copied += job.size
 
 
 async def _copier(state: _State, copy_args: dict) -> None:
@@ -291,7 +294,7 @@ async def _copier(state: _State, copy_args: dict) -> None:
         except (TransferError, asyncssh.SFTPError) as error:
             if not _is_per_entry_error(state, error):
                 raise
-            state.fail(job.src_path, str(getattr(error, "reason", None) or error))
+            state.fail(job.src_path, error.reason if isinstance(error, ConflictError) else explain(error)[1])
         state.files_done += 1
         state.bytes_done += job.size  # failed and skipped files count as processed
         state.emit_progress()
@@ -329,7 +332,7 @@ async def copy_tree(
     *,
     links: bool = False,
     verify: bool = False,
-    overwrite: bool = False,
+    on_conflict="refuse",
     created_dirs: set | None = None,
     chunk_size: int = 4 * 1024 * 1024,
     queue_depth: int = 4,
@@ -340,12 +343,12 @@ async def copy_tree(
         raise TransferError(f"'{src_path}' is not a directory")
 
     state = _State(
-        src, dst, src_path, dst_path, on_event, links, overwrite,
+        src, dst, src_path, dst_path, on_event, links, on_conflict,
         created_dirs if created_dirs is not None else set(), TreeResult(),
         asyncio.Queue(maxsize=WALK_QUEUE_SIZE),
         marker=resume.make_marker(src.alias, src_path),
     )
-    copy_args = {"verify": verify, "overwrite": overwrite, "chunk_size": chunk_size, "queue_depth": queue_depth}
+    copy_args = {"verify": verify, "chunk_size": chunk_size, "queue_depth": queue_depth}
     # Same TaskGroup pattern as transfer.py: a crash in one task cancels the other.
     try:
         async with asyncio.TaskGroup() as group:

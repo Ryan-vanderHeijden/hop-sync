@@ -11,8 +11,10 @@ from dataclasses import dataclass, field
 
 import asyncssh
 
+from .conflict import DECISIONS, POLICIES, ConflictInfo
 from .copy import copy_path
 from .errors import TransferError
+from .explain import blame, explain
 from .events import (
     EntryFailed,
     EntrySkipped,
@@ -22,7 +24,7 @@ from .events import (
     TreeProgress,
 )
 from .paths import RemotePath
-from .session import ConnectError, HostKeyError, KeyNeedsPassphrase
+from .session import ConnectError
 from .sessions import SessionPool
 from .transfer import resolve_destination
 
@@ -42,7 +44,24 @@ class JobState(enum.Enum):
 class JobOptions:
     verify: bool = False
     links: bool = False
-    overwrite: bool = False
+    on_conflict: str = "refuse"  # one of conflict.POLICIES
+
+
+@dataclass(frozen=True)
+class PendingConflict:
+    """A file that exists on the destination, waiting for the user's decision."""
+
+    conflict_id: str
+    job_id: str
+    path: str
+    src_size: int
+    src_mtime: int
+    dst_size: int
+    dst_mtime: int
+
+
+class NoPendingConflict(TransferError):
+    """The conflict being answered is not (or no longer) waiting."""
 
 
 @dataclass
@@ -62,6 +81,7 @@ class Job:
     message: str = ""  # an error, or "reconnecting (attempt 2/5) in 4s"
     error_kind: str | None = None  # "auth", "passphrase", "hostkey", "connection" or "other"
     error_alias: str | None = None  # the host an auth/key problem is about
+    pending_conflict: PendingConflict | None = None  # set while waiting for a decision
     attempt: int = 1  # incremented by every manual retry
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -165,6 +185,10 @@ class JobManager:
         self._created_dirs: dict[str, set] = {}
         self._resolved: dict[str, str] = {}
         self._last_emit: dict[str, float] = {}
+        # "ask" policy: the future a waiting job sleeps on, and decisions
+        # remembered with "apply to all" (for that job only).
+        self._waiting: dict[str, tuple[str, asyncio.Future]] = {}
+        self._remembered: dict[str, str] = {}
 
     # ---- public API ----------------------------------------------------
 
@@ -172,7 +196,10 @@ class JobManager:
         """Queue a copy. Same-host copies are refused (relaying is pointless)."""
         if src.host == dst.host:
             raise TransferError("source and destination are on the same host; copy on the host itself")
-        job = Job(uuid.uuid4().hex[:8], src, dst, JobOptions(**options))
+        job_options = JobOptions(**options)
+        if job_options.on_conflict not in POLICIES:
+            raise ValueError(f"unknown conflict policy '{job_options.on_conflict}'")
+        job = Job(uuid.uuid4().hex[:8], src, dst, job_options)
         self._jobs[job.id] = job
         self._created_dirs[job.id] = set()
         self._emit(job)
@@ -212,9 +239,51 @@ class JobManager:
         job.error_kind = job.error_alias = None
         job.started_at = job.finished_at = None
         job.attempt += 1
+        self._remembered.pop(job.id, None)
         self._emit(job)
         self._start(job)
         return job
+
+    def resolve_conflict(self, job_id: str, conflict_id: str, decision: str, apply_to_all: bool = False) -> None:
+        """Answer a waiting job. With apply_to_all the answer is reused for
+        every later conflict in the same job."""
+        if decision not in DECISIONS:
+            raise ValueError(f"unknown decision '{decision}'")
+        waiting = self._waiting.get(job_id)
+        if waiting is None or waiting[0] != conflict_id or waiting[1].done():
+            raise NoPendingConflict("that conflict is no longer waiting")
+        waiting[1].set_result((decision, apply_to_all))
+
+    async def _ask_user(self, job: Job, info: ConflictInfo) -> str:
+        """Park the job until resolve_conflict() is called (or it is cancelled)."""
+        # The job stays "running" and keeps its concurrency slot while it waits.
+        pending = PendingConflict(
+            uuid.uuid4().hex[:8], job.id, info.dst_path,
+            info.src_size, info.src_mtime, info.dst_size, info.dst_mtime,
+        )
+        future = asyncio.get_running_loop().create_future()
+        self._waiting[job.id] = (pending.conflict_id, future)
+        job.pending_conflict, job.message = pending, "waiting for your decision"
+        self._emit(job)
+        try:
+            decision, apply_to_all = await future
+        finally:  # also runs when the job is cancelled while waiting
+            self._waiting.pop(job.id, None)
+            job.pending_conflict, job.message = None, ""
+            self._emit(job)
+        if apply_to_all:
+            self._remembered[job.id] = decision
+        return decision
+
+    def _conflict_policy(self, job: Job):
+        """A policy name, or (for "ask") a function that asks the user."""
+        if job.options.on_conflict != "ask":
+            return job.options.on_conflict
+
+        async def ask(info: ConflictInfo) -> str:
+            return self._remembered.get(job.id) or await self._ask_user(job, info)
+
+        return ask
 
     async def wait_idle(self) -> None:
         """Wait until no job is queued or running."""
@@ -259,7 +328,7 @@ class JobManager:
                 if isinstance(error, ConnectError) or not dropped:
                     raise  # auth/host-key/other errors are never retried
                 if retry_number == len(self._backoff):
-                    raise _GaveUp(f"connection lost: {error or type(error).__name__}") from error
+                    raise _GaveUp(self._gave_up_message(error, used)) from error
                 for endpoint in used:
                     self._pool.invalidate(endpoint.alias, only_if=endpoint)
                 delay = self._backoff[retry_number]
@@ -267,10 +336,18 @@ class JobManager:
                 self._emit(job)
                 await asyncio.sleep(delay)
 
+    @staticmethod
+    def _gave_up_message(error: Exception, used: list) -> str:
+        closed = [endpoint.alias for endpoint in used if endpoint.conn.is_closed()]
+        message = explain(error, alias=closed[0] if closed else None)[1]
+        return message if message.startswith("connection") else f"connection lost: {message}"
+
     async def _attempt(self, job: Job, used: list) -> None:
-        src_end = await self._pool.get(job.src.host)
+        with blame(job.src.host, None):  # so errors say which host failed to connect
+            src_end = await self._pool.get(job.src.host)
         used.append(src_end)
-        dst_end = await self._pool.get(job.dst.host)
+        with blame(job.dst.host, None):
+            dst_end = await self._pool.get(job.dst.host)
         used.append(dst_end)
         job.message = ""
         # Resolve the destination once: after a first attempt created a new
@@ -283,7 +360,7 @@ class JobManager:
             )
         result = await self._copier(
             src_end, job.src.path, dst_end, self._resolved[job.id], _Progress(self, job),
-            links=job.options.links, verify=job.options.verify, overwrite=job.options.overwrite,
+            links=job.options.links, verify=job.options.verify, on_conflict=self._conflict_policy(job),
             chunk_size=self._chunk_size, created_dirs=self._created_dirs[job.id],
         )
         if result is not None and result.failed:
@@ -296,20 +373,15 @@ class JobManager:
     # ---- state changes -------------------------------------------------
 
     def _fail(self, job: Job, error: Exception) -> None:
-        job.message = str(error) or type(error).__name__
-        job.error_kind = "other"
-        if isinstance(error, KeyNeedsPassphrase):
-            job.error_kind = "passphrase"
-        elif isinstance(error, HostKeyError):
-            job.error_kind = "hostkey"
-        elif isinstance(error, ConnectError):
-            job.error_kind = "auth"
-        elif isinstance(error, _GaveUp):
-            job.error_kind = "connection"
+        if isinstance(error, _GaveUp):
+            job.error_kind, job.message = "connection", str(error)
+        else:
+            job.error_kind, job.message = explain(error)
         job.error_alias = getattr(error, "alias", None)
         self._finish(job, JobState.FAILED)
 
     def _finish(self, job: Job, state: JobState) -> None:
+        job.pending_conflict = None
         job.state = state
         job.finished_at = time.time()
         self._emit(job)

@@ -12,6 +12,7 @@ from datetime import datetime
 import asyncssh
 
 from .core.errors import TransferError
+from .core.explain import explain
 from .core.jobs import JobChanged, JobEntryEvent, JobManager, JobState
 from .core.events import EntryFailed, EntrySkipped
 from .core.listing import list_dir
@@ -242,7 +243,7 @@ async def run_copy(args) -> int:
         if len(sources) > 1:
             await require_directory(pool, dst)
         for source in sources:
-            manager.add(source, dst, verify=args.verify, links=args.links, overwrite=args.overwrite)
+            manager.add(source, dst, verify=args.verify, links=args.links, on_conflict=conflict_policy(args))
         await wait_for_jobs(manager, passphrases)
     except asyncio.CancelledError:  # Ctrl+C
         manager.cancel_all()
@@ -259,6 +260,11 @@ async def run_serve(args) -> int:
     from .api.serve import run_serve as serve  # imported here: list/copy do not need the web stack
 
     return await serve(args)
+
+
+def conflict_policy(args) -> str:
+    """--overwrite is an alias for --on-conflict overwrite."""
+    return "overwrite" if args.overwrite else (args.on_conflict or "refuse")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -279,7 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
     copy_cmd.add_argument("--jobs", type=int, default=2, help="copies running at once (default 2)")
     copy_cmd.add_argument("--links", action="store_true", help="copy symlinks as links (directories only)")
     copy_cmd.add_argument(
-        "--overwrite", action="store_true", help="replace existing destination files that differ"
+        "--on-conflict", choices=["refuse", "skip", "rename", "overwrite"], default=None,
+        help="what to do when a different file already exists at the destination (default: refuse)",
+    )
+    copy_cmd.add_argument(
+        "--overwrite", action="store_true", help="replace existing destination files that differ "
+        "(same as --on-conflict overwrite)"
     )
     copy_cmd.add_argument("--verify", action="store_true", help="also compare sha256 checksums")
     return parser
@@ -292,18 +303,18 @@ def main(argv=None) -> int:
         parser.error("copy needs at least one source and a destination")
     if args.command == "copy" and args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    if args.command == "copy" and args.overwrite and args.on_conflict not in (None, "overwrite"):
+        parser.error("--overwrite cannot be combined with --on-conflict " + args.on_conflict)
     runner = {"list": run_list, "copy": run_copy, "serve": run_serve}[args.command]
     try:
         return asyncio.run(runner(args)) or 0
     except KeyboardInterrupt:
         print("\npartial files kept; run the same command again to resume", file=sys.stderr)
         return 130
-    except (ConnectError, TransferError, ValueError) as exc:
+    except ValueError as exc:
         return fail(str(exc))
-    except asyncssh.SFTPError as exc:
-        return fail(f"SFTP error: {exc.reason}")
-    except (asyncssh.Error, OSError) as exc:
-        return fail(f"connection problem: {exc}")
+    except (ConnectError, TransferError, asyncssh.Error, OSError) as exc:
+        return fail(explain(exc)[1])  # the same wording the web UI shows
 
 
 def fail(message: str) -> int:

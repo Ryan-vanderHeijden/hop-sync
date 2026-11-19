@@ -45,6 +45,12 @@ export function listDir(host, path, signal) {
 
 export const createJob = (src, dst, options) => request("POST", "/api/jobs", { src, dst, ...options });
 export const cancelJob = (id) => request("DELETE", `/api/jobs/${encodeURIComponent(id)}`);
+export const resolveConflict = (id, conflictId, decision, applyToAll) =>
+  request("POST", `/api/jobs/${encodeURIComponent(id)}/conflict`, {
+    conflict_id: conflictId,
+    decision,
+    apply_to_all: applyToAll,
+  });
 export const retryJob = (id) => request("POST", `/api/jobs/${encodeURIComponent(id)}/retry`);
 
 // Opens /api/events and reconnects with a growing delay (1 s up to 10 s).

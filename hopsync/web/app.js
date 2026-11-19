@@ -1,6 +1,7 @@
 // Wires the panes, the progress panel, drag-and-drop and copy/paste together.
 
-import { cancelJob, connectEvents, createJob, getHosts, onSessionEnded, retryJob } from "./api.js";
+import { cancelJob, connectEvents, createJob, getHosts, onSessionEnded, resolveConflict, retryJob } from "./api.js";
+import { ConflictDialog } from "./conflict.js";
 import { el } from "./dom.js";
 import { posixDirname } from "./format.js";
 import { JobsPanel } from "./jobs.js";
@@ -11,6 +12,7 @@ const $ = (id) => document.getElementById(id);
 let clipboard = null; // { host, paths }: our own "copy" buffer, not the system clipboard
 let panes = [];
 let jobsPanel = null;
+let conflictDialog = null;
 
 // ---- small helpers ---------------------------------------------------------
 
@@ -20,17 +22,25 @@ function toast(text) {
   setTimeout(() => box.remove(), 4500);
 }
 
-// The three checkboxes. Overwrite is deliberately never remembered.
+// The options in the top bar. The conflict choice is deliberately never
+// remembered: it always starts as "Ask".
 function currentOptions() {
   return {
     verify: $("opt-verify").checked,
     links: $("opt-links").checked,
-    overwrite: $("opt-overwrite").checked,
+    on_conflict: $("opt-conflict").value,
   };
 }
 
 function resetOptions() {
-  for (const id of ["opt-verify", "opt-links", "opt-overwrite"]) $(id).checked = false;
+  for (const id of ["opt-verify", "opt-links"]) $(id).checked = false;
+  $("opt-conflict").value = "ask";
+  showConflictWarning();
+}
+
+// Overwrite is shown in the warning style.
+function showConflictWarning() {
+  $("conflict-option").classList.toggle("warning", $("opt-conflict").value === "overwrite");
 }
 
 function focusedPane() {
@@ -131,7 +141,14 @@ async function start() {
   window.addEventListener("pageshow", resetOptions); // browsers may restore form state
   onSessionEnded(() => ($("banner").hidden = false));
   panes = createPanes();
+  $("opt-conflict").addEventListener("change", showConflictWarning);
+  conflictDialog = new ConflictDialog($("conflict-dialog"), {
+    onDecide: (jobId, conflictId, decision, applyToAll) =>
+      resolveConflict(jobId, conflictId, decision, applyToAll).catch(reportError),
+  });
   jobsPanel = new JobsPanel($("jobs"), {
+    onShowConflict: (id) => conflictDialog.reopen(id),
+    onUpdate: (jobs) => conflictDialog.sync(jobs),
     onCancel: (id) => cancelJob(id).catch(reportError),
     onRetry: (id) => retryJob(id).catch(reportError),
     onJobFinished: refreshPanesFor,

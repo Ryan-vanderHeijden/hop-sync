@@ -3,6 +3,20 @@
 from ..core.jobs import Job
 
 
+def pending_conflict_to_json(conflict) -> dict | None:
+    if conflict is None:
+        return None
+    return {
+        "conflict_id": conflict.conflict_id,
+        "job_id": conflict.job_id,
+        "path": conflict.path,
+        "src_size": conflict.src_size,
+        "src_mtime": conflict.src_mtime,
+        "dst_size": conflict.dst_size,
+        "dst_mtime": conflict.dst_mtime,
+    }
+
+
 def job_to_json(job: Job) -> dict:
     """The one place that decides what a job looks like to API clients."""
     return {
@@ -12,7 +26,7 @@ def job_to_json(job: Job) -> dict:
         "options": {
             "verify": job.options.verify,
             "links": job.options.links,
-            "overwrite": job.options.overwrite,
+            "on_conflict": job.options.on_conflict,
         },
         "state": job.state.value,
         "bytes_done": job.bytes_done,
@@ -25,6 +39,7 @@ def job_to_json(job: Job) -> dict:
         "message": job.message,
         "error_kind": job.error_kind,
         "error_alias": job.error_alias,
+        "pending_conflict": pending_conflict_to_json(job.pending_conflict),
         "attempt": job.attempt,
         "created_at": job.created_at,
         "started_at": job.started_at,

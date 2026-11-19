@@ -161,7 +161,7 @@ async def test_existing_identical_destination_is_already_copied():
 
 async def test_overwrite_replaces_existing_destination():
     src, dst = endpoints({"a": FakeFile(b"new data")}, {"b": FakeFile(b"old")})
-    await copy_file(src, "a", dst, "b", lambda e: None, overwrite=True)
+    await copy_file(src, "a", dst, "b", lambda e: None, on_conflict="overwrite")
     assert bytes(dst.sftp.files["b"].data) == b"new data"
 
 

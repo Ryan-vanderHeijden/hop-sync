@@ -4,6 +4,7 @@ import asyncio
 import dataclasses
 import mimetypes
 from pathlib import Path
+from typing import Literal
 
 import asyncssh
 from fastapi import FastAPI, Query, Request, WebSocket
@@ -15,7 +16,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.websockets import WebSocketDisconnect
 
 from ..core.errors import TransferError
-from ..core.jobs import JobManager
+from ..core.explain import explain
+from ..core.jobs import JobManager, NoPendingConflict
 from ..core.listing import list_dir
 from ..core.paths import RemotePath, normalize_path
 from ..core.session import AuthFailed, HostKeyError, KeyNeedsPassphrase
@@ -36,6 +38,7 @@ register_mime_types()
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 MAX_PATH_LENGTH = 4096
+KIND_STATUS = {"not_found": 404, "permission_denied": 403}  # everything else from explain is a 502
 
 
 class ApiError(Exception):
@@ -51,12 +54,18 @@ class RemoteRef(BaseModel):
     path: str
 
 
+class ConflictAnswer(BaseModel):
+    conflict_id: str
+    decision: Literal["overwrite", "skip", "rename"]
+    apply_to_all: bool = False
+
+
 class JobRequest(BaseModel):
     src: RemoteRef
     dst: RemoteRef
     verify: bool = False
     links: bool = False
-    overwrite: bool = False
+    on_conflict: Literal["refuse", "ask", "skip", "rename", "overwrite"] = "ask"
 
 
 def error_response(status: int, kind: str, message: str) -> JSONResponse:
@@ -147,7 +156,7 @@ def create_app(
     async def create_job(request: JobRequest):
         src, dst = remote(request.src), remote(request.dst)
         try:
-            job = manager.add(src, dst, verify=request.verify, links=request.links, overwrite=request.overwrite)
+            job = manager.add(src, dst, verify=request.verify, links=request.links, on_conflict=request.on_conflict)
         except TransferError as error:  # same-host copy
             raise ApiError(400, "invalid", str(error)) from None
         return job_to_json(job)
@@ -173,6 +182,15 @@ def create_app(
             return job_to_json(manager.retry(job_id))
         except TransferError as error:
             raise ApiError(409, "state", str(error)) from None
+
+    @app.post("/api/jobs/{job_id}/conflict")
+    async def answer_conflict(job_id: str, answer: ConflictAnswer):
+        find_job(job_id)
+        try:
+            manager.resolve_conflict(job_id, answer.conflict_id, answer.decision, answer.apply_to_all)
+        except NoPendingConflict as error:
+            raise ApiError(409, "state", str(error)) from None
+        return {"ok": True}
 
     # ---- events ------------------------------------------------------------
 
@@ -205,36 +223,20 @@ def create_app(
     async def http_error(request: Request, error: StarletteHTTPException):
         return error_response(error.status_code, "http", str(error.detail))
 
-    @app.exception_handler(asyncssh.SFTPNoSuchFile)
-    @app.exception_handler(asyncssh.SFTPNoSuchPath)
-    async def no_such_file(request: Request, error: Exception):
-        return error_response(404, "not_found", "no such file or directory")
+    def explained(request: Request, error: Exception):
+        """One mapping for every SSH/SFTP error, worded by core.explain."""
+        on_listing = request.url.path == "/api/list"
+        alias = request.query_params.get("host") if on_listing else None
+        path = request.query_params.get("path") if on_listing else None
+        kind, message = explain(error, alias=alias, path=path)
+        return error_response(KIND_STATUS.get(kind, 502), "auth" if kind == "passphrase" else kind, message)
 
-    @app.exception_handler(asyncssh.SFTPPermissionDenied)
-    async def permission_denied(request: Request, error: Exception):
-        return error_response(403, "permission_denied", "permission denied")
-
-    @app.exception_handler(AuthFailed)
-    @app.exception_handler(KeyNeedsPassphrase)
-    async def auth_failed(request: Request, error):
-        alias = error.alias or "<alias>"
-        return error_response(502, "auth", f"restart hopsync with --password-for {alias}")
-
-    @app.exception_handler(HostKeyError)
-    async def host_key(request: Request, error: HostKeyError):
-        return error_response(502, "hostkey", str(error))
-
-    @app.exception_handler(asyncssh.DisconnectError)
-    @app.exception_handler(asyncssh.SFTPConnectionLost)
-    @app.exception_handler(asyncssh.SFTPNoConnection)
-    @app.exception_handler(OSError)
-    @app.exception_handler(TimeoutError)
-    async def connection_problem(request: Request, error: Exception):
-        return error_response(502, "connection", f"connection problem: {error}")
-
-    @app.exception_handler(asyncssh.SFTPError)
-    async def sftp_error(request: Request, error: asyncssh.SFTPError):
-        return error_response(502, "sftp", f"SFTP error: {error.reason}")
+    for error_class in (
+        asyncssh.SFTPNoSuchFile, asyncssh.SFTPNoSuchPath, asyncssh.SFTPPermissionDenied,
+        AuthFailed, KeyNeedsPassphrase, HostKeyError, asyncssh.DisconnectError,
+        asyncssh.SFTPConnectionLost, asyncssh.SFTPNoConnection, OSError, TimeoutError, asyncssh.SFTPError,
+    ):
+        app.add_exception_handler(error_class, explained)
 
     @app.exception_handler(Exception)
     async def unexpected(request: Request, error: Exception):

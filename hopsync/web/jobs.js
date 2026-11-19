@@ -6,10 +6,10 @@ import { etaSeconds, formatEta, formatSpeed, humanSize, SpeedTracker } from "./f
 const FINAL_STATES = ["done", "failed", "cancelled"];
 
 export class JobsPanel {
-  // callbacks: { onCancel(id), onRetry(id), onJobFinished(job) }
+  // callbacks: { onCancel(id), onRetry(id), onJobFinished(job), onShowConflict(id), onUpdate(jobs) }
   constructor(root, callbacks) {
     this.root = root;
-    this.callbacks = callbacks;
+    this.callbacks = { onShowConflict() {}, onUpdate() {}, ...callbacks };
     this.jobs = new Map(); // id -> latest job
     this.entries = new Map(); // id -> { skipped: number, failed: [{path, reason}] }
     this.trackers = new Map(); // id -> SpeedTracker
@@ -49,6 +49,7 @@ export class JobsPanel {
     else if (message.type === "job") this.applyJob(message.job);
     else if (message.type === "entry") this.applyEntry(message);
     this.scheduleRender();
+    this.callbacks.onUpdate(this.jobs);
   }
 
   // A snapshot replaces the job list. Entry details cannot be re-sent by
@@ -178,6 +179,11 @@ export class JobsPanel {
       const eta = etaSeconds(job, speed);
       if (eta !== null) details.append(el("span", "", `ETA ${formatEta(eta)}`));
       if (job.current_file) details.append(el("span", "current-file", job.current_file));
+    }
+    if (job.pending_conflict) {
+      const waiting = el("button", "link-button waiting", "1 decision waiting");
+      waiting.addEventListener("click", () => this.callbacks.onShowConflict(job.id));
+      details.append(waiting);
     }
     if (job.message) details.append(el("span", `message ${job.state}`, job.message));
     const record = this.entries.get(job.id);

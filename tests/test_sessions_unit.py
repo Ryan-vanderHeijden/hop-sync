@@ -268,7 +268,7 @@ async def test_gives_up_after_five_reconnects():
     job = manager.add(SRC, DST)
     await manager.wait_idle()
     final = manager.get(job.id)
-    assert final.state is JobState.FAILED and final.message.startswith("connection lost:")
+    assert final.state is JobState.FAILED and final.message.startswith("connection") and final.error_kind == "connection"
     assert len(attempts) == 6  # the first try plus 5 reconnect attempts
 
 

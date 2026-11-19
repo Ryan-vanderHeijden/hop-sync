@@ -245,7 +245,7 @@ async def test_overwrite_flag_replaces_existing_destination(hosts, monkeypatch):
     async with hpc_to_server(hosts) as (src, dst):
         await put_file(dst.conn, "over.bin", b"old contents")
         await put_file(src.conn, "over.bin", new_data)
-        await copy_file(src, "over.bin", dst, "over.bin", lambda e: None, overwrite=True)
+        await copy_file(src, "over.bin", dst, "over.bin", lambda e: None, on_conflict="overwrite")
         assert await sha256_remote(dst.conn, "over.bin") == hashlib.sha256(new_data).hexdigest()
         await put_file(dst.conn, "over2.bin", b"old contents")
         await src.conn.run("cp over.bin over2.bin", check=True)

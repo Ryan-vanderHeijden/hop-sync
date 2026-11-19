@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 WEB = Path(__file__).parent.parent / "hopsync" / "web"
 PORT = api_fixtures.PORT
-MODULES = ["api", "app", "dom", "format", "jobs", "pane"]
+MODULES = ["api", "app", "conflict", "dom", "format", "jobs", "pane"]
 
 
 def make_client():

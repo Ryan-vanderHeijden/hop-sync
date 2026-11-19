@@ -13,7 +13,14 @@
     <strong class="app-name">hopsync</strong>
     <label><input type="checkbox" id="opt-verify" autocomplete="off"> Verify (sha256)</label>
     <label><input type="checkbox" id="opt-links" autocomplete="off"> Copy symlinks as links</label>
-    <label class="warning"><input type="checkbox" id="opt-overwrite" autocomplete="off"> Overwrite existing files</label>
+    <label id="conflict-option" class="conflict-option">If a file exists:
+      <select id="opt-conflict" autocomplete="off">
+        <option value="ask">Ask</option>
+        <option value="skip">Skip</option>
+        <option value="rename">Keep both (rename)</option>
+        <option value="overwrite">Overwrite</option>
+      </select>
+    </label>
   </header>
 
   <main class="panes">
@@ -22,6 +29,8 @@
   </main>
 
   <section id="jobs" class="jobs"></section>
+  <dialog id="conflict-dialog" class="conflict-dialog"></dialog>
+
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
   <script type="module" src="/app.js"></script>

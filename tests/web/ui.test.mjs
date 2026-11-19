@@ -19,13 +19,17 @@ const listing = {
 };
 
 let requests = [];
-globalThis.fetch = async (url) => {
+let lastInit = null;
+globalThis.fetch = async (url, init) => {
   requests.push(String(url));
+  lastInit = init;
   return { ok: true, status: 200, json: async () => listing };
 };
 
 const { Pane, DRAG_TYPE } = await import("../../hopsync/web/pane.js");
 const { JobsPanel } = await import("../../hopsync/web/jobs.js");
+const { ConflictDialog } = await import("../../hopsync/web/conflict.js");
+const { resolveConflict } = await import("../../hopsync/web/api.js");
 
 function makePane() {
   const calls = { dropped: [], loaded: 0 };
@@ -157,4 +161,79 @@ test("jobs panel: ETA only for a running job with a complete walk and known spee
   const panel = new JobsPanel(new FakeElement("section"), { onCancel() {}, onRetry() {}, onJobFinished() {} });
   panel.handleMessage({ type: "snapshot", jobs: [job({ walk_complete: true, bytes_transferred: 0 })] });
   assert.ok(!panel.body.textContent.includes("ETA"));
+});
+
+function jobWithConflict(id = "abc12345", conflictId = "c1") {
+  return job({
+    id,
+    pending_conflict: {
+      conflict_id: conflictId, job_id: id, path: "/out/dir/report <1>.txt",
+      src_size: 2048, src_mtime: 1700000000, dst_size: 10, dst_mtime: 1600000000,
+    },
+  });
+}
+
+const buttonsIn = (dialog) => dialog.all().filter((n) => n.tagName === "BUTTON");
+
+test("conflict dialog shows both files, focuses Skip and posts the decision", async () => {
+  const decisions = [];
+  const dialog = new FakeElement("dialog");
+  const view = new ConflictDialog(dialog, {
+    onDecide: (...args) => { decisions.push(args); return resolveConflict(...args); },
+  });
+  view.sync(new Map([["abc12345", jobWithConflict()]]));
+  assert.equal(dialog.open, true);
+  const text = dialog.textContent;
+  assert.ok(text.includes("report <1>.txt") && text.includes("2.0 KB") && text.includes("10 B"));
+  assert.equal(globalThis.document.activeElement.textContent, "Skip"); // never Overwrite
+  const names = buttonsIn(dialog).map((b) => b.textContent);
+  assert.deepEqual(names, ["Overwrite", "Skip", "Keep both"]);
+
+  const checkbox = dialog.all().find((n) => n.tagName === "INPUT");
+  checkbox.checked = true;
+  buttonsIn(dialog).find((b) => b.textContent === "Skip").dispatch("click");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(decisions, [["abc12345", "c1", "skip", true]]);
+  assert.equal(requests.at(-1), "/api/jobs/abc12345/conflict");
+  assert.equal(lastInit.method, "POST");
+  assert.deepEqual(JSON.parse(lastInit.body), { conflict_id: "c1", decision: "skip", apply_to_all: true });
+  assert.equal(dialog.open, false);
+
+  // the server still lists it for a moment: the dialog must not pop up again
+  view.sync(new Map([["abc12345", jobWithConflict()]]));
+  assert.equal(dialog.open, false);
+});
+
+test("conflict dialog: Escape keeps the job waiting; the badge reopens; jobs go one at a time", () => {
+  const dialog = new FakeElement("dialog");
+  const view = new ConflictDialog(dialog, { onDecide() {} });
+  const jobs = new Map([
+    ["first000", jobWithConflict("first000", "c1")],
+    ["second00", jobWithConflict("second00", "c2")],
+  ]);
+  view.sync(jobs);
+  assert.equal(view.current.conflict_id, "c1"); // queue order
+  dialog.close(); // what Escape does: closes without a decision
+  assert.equal(view.current.conflict_id, "c2"); // the next waiting job
+  dialog.close();
+  assert.equal(view.current, null);
+  view.sync(jobs);
+  assert.equal(dialog.open, false); // dismissed ones stay closed
+  view.reopen("first000");
+  assert.equal(dialog.open, true);
+  assert.equal(view.current.conflict_id, "c1");
+  // the job is cancelled meanwhile: the dialog goes away by itself
+  view.sync(new Map([["first000", job({ id: "first000", state: "cancelled" })]]));
+  assert.equal(dialog.open, false);
+});
+
+test("jobs panel shows a 'decision waiting' badge that reopens the dialog", () => {
+  const shown = [];
+  const panel = new JobsPanel(new FakeElement("section"), {
+    onCancel() {}, onRetry() {}, onJobFinished() {}, onShowConflict: (id) => shown.push(id),
+  });
+  panel.handleMessage({ type: "snapshot", jobs: [jobWithConflict()] });
+  const badge = panel.body.all().find((n) => n.tagName === "BUTTON" && n.textContent === "1 decision waiting");
+  badge.dispatch("click");
+  assert.deepEqual(shown, ["abc12345"]);
 });

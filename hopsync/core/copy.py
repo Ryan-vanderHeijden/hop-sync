@@ -16,7 +16,7 @@ async def copy_path(
     *,
     links: bool = False,
     verify: bool = False,
-    overwrite: bool = False,
+    on_conflict="refuse",
     chunk_size: int = 4 * 1024 * 1024,
     created_dirs: set | None = None,
 ) -> TreeResult | None:
@@ -26,9 +26,10 @@ async def copy_path(
     if stat.S_ISDIR(attrs.permissions or 0):
         return await copy_tree(
             src, src_path, dst, dst_path, on_event, links=links, verify=verify,
-            overwrite=overwrite, created_dirs=created_dirs, chunk_size=chunk_size,
+            on_conflict=on_conflict, created_dirs=created_dirs, chunk_size=chunk_size,
         )
     await copy_file(
-        src, src_path, dst, dst_path, on_event, verify=verify, overwrite=overwrite, chunk_size=chunk_size
+        src, src_path, dst, dst_path, on_event, verify=verify, on_conflict=on_conflict,
+        check_space=True, chunk_size=chunk_size,  # only single files get the free-space pre-flight
     )
     return None

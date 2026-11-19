@@ -56,6 +56,8 @@ export class FakeElement {
   contains(other) { let n = other; while (n) { if (n === this) return true; n = n.parent; } return false; }
   focus() { globalThis.document.activeElement = this; }
   scrollIntoView() {}
+  showModal() { this.open = true; }
+  close() { if (this.open) { this.open = false; this.dispatch("close"); } }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this); }
 }
 

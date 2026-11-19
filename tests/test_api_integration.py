@@ -102,6 +102,7 @@ async def test_full_flow_over_http_and_websocket(hosts, server):
             # Conflict: a different file already sits at the destination.
             await run(server_end.conn, "echo different > api-conflict.bin")
             body["dst"]["path"] = "api-conflict.bin"
+            body["on_conflict"] = "refuse"  # the default, "ask", would wait for an answer
             created = await http.post("/api/jobs", json=body)
             job, _ = await wait_for_job(ws, created.json()["id"], {"done", "failed"})
             assert job["state"] == "failed" and "exists and differs" in job["message"]
