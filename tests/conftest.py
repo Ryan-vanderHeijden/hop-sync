@@ -82,3 +82,11 @@ def hosts():
         yield Hosts(good, bad, PASSWORD)
     finally:
         subprocess.run([*COMPOSE, "down", "-v"], capture_output=True)
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings_file(monkeypatch, tmp_path_factory):
+    """Never read (or create) the real settings.toml of whoever runs the tests."""
+    config_home = tmp_path_factory.mktemp("config-home")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(config_home))
+    monkeypatch.setenv("APPDATA", str(config_home))

@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hopsync"
-version = "0.1.0"
-description = "Relay files between two SFTP hosts through this computer"
+dynamic = ["version"]  # read from hopsync/__init__.py, so there is one place to change
+description = "Move files between two SFTP hosts through your computer, with a dual-pane web UI"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["asyncssh", "fastapi", "uvicorn", "websockets"]
 
@@ -14,6 +15,9 @@ dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.scripts]
 hopsync = "hopsync.cli:main"
+
+[tool.hatch.version]
+path = "hopsync/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hopsync"]

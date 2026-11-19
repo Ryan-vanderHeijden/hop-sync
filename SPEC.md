@@ -88,6 +88,7 @@ Key rule: `core` emits progress as events (callback or asyncio queue). The CLI, 
 - Clear error messages (permission denied, disk full, connection lost).
 - Optional `--tar` mode for directories with huge numbers of small files: `tar cf - -C <parent> <name>` on the source piped to `tar xf - -C <destdir>` on the destination. No compression (it mostly costs login-node CPU). Every path argument goes through `shlex.quote`. This mode has no resume and only shows bytes streamed so far, with no total.
 - Packaging: `pipx`-installable, single `hopsync` command that starts the server and opens the browser.
+- Settings file (`settings.toml`, no secrets) for the host list, password hosts, ssh config path, jobs and port; `hopsync` alone starts the UI.
 - README with setup and usage.
 
 ## Security requirements

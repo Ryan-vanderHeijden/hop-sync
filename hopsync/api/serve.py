@@ -11,7 +11,7 @@ import uvicorn
 from ..core.jobs import JobManager
 from ..core.session import KeyNeedsPassphrase
 from ..core.sessions import SessionPool
-from ..core.sshconfig import list_host_aliases
+from ..settings import effective_aliases, print_warnings
 from .app import create_app
 from .hub import EventHub
 
@@ -50,10 +50,12 @@ async def run_serve(args) -> int:
     try:
         await connect_eagerly(pool, args.password_for, passwords)
         hub = EventHub()
-        manager = JobManager(pool, hub.publish)
+        manager = JobManager(pool, hub.publish, getattr(args, "jobs", None) or 2)
         token, session_secret = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         port = args.port or pick_free_port()
-        app = create_app(manager, pool, list_host_aliases(args.config), token, session_secret, port, hub)
+        aliases, warnings = effective_aliases(getattr(args, "hosts", None), args.config)
+        print_warnings(warnings)
+        app = create_app(manager, pool, aliases, token, session_secret, port, hub)
         server = uvicorn.Server(build_uvicorn_config(app, port))
 
         url = f"http://{HOST}:{port}/auth?token={token}"

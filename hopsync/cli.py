@@ -11,14 +11,16 @@ from datetime import datetime
 
 import asyncssh
 
+from . import __version__
 from .core.errors import TransferError
-from .core.explain import explain
+from .core.explain import blame, explain
 from .core.jobs import JobChanged, JobEntryEvent, JobManager, JobState
 from .core.events import EntryFailed, EntrySkipped
 from .core.listing import list_dir
 from .core.paths import RemotePath, parse_remote
 from .core.session import ConnectError, KeyNeedsPassphrase, connect
 from .core.sessions import SessionPool
+from .settings import apply_settings, create_template, load_settings, print_warnings, settings_path
 
 
 def human_size(num: float) -> str:
@@ -184,10 +186,13 @@ def ask_passwords(args) -> dict:
 async def run_list(args) -> None:
     remote = parse_remote(args.target)
     passwords = ask_passwords(args)
-    conn = await open_connection(remote.host, args, passwords)
+    with blame(remote.host, remote.path):  # so errors can say which host and path
+        conn = await open_connection(remote.host, args, passwords)
     try:
         async with conn.start_sftp_client() as sftp:
-            for e in await list_dir(sftp, remote.path):
+            with blame(remote.host, remote.path):
+                entries = await list_dir(sftp, remote.path)
+            for e in entries:
                 kind = "d" if e.is_dir else "l" if e.is_link else "-"
                 when = datetime.fromtimestamp(e.mtime).strftime("%Y-%m-%d %H:%M")
                 print(f"{kind} {human_size(e.size):>8} {when}  {e.name}")
@@ -238,7 +243,7 @@ async def run_copy(args) -> int:
         reporter(event)
         passphrases(event)
 
-    manager = JobManager(pool, on_event, args.jobs)
+    manager = JobManager(pool, on_event, args.jobs or 2)  # None: main() fills it from settings
     try:
         if len(sources) > 1:
             await require_directory(pool, dst)
@@ -274,15 +279,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--password-for", action="append", default=[], metavar="ALIAS",
         help="prompt for this host's password (repeatable)",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"hopsync {__version__}")
+    # No subcommand means "serve" (see parse_args below).
+    sub = parser.add_subparsers(dest="command", required=False)
+    sub.add_parser("settings", help="show where settings.toml is, and create a template if it is missing")
     list_cmd = sub.add_parser("list", help="list a remote directory")
     list_cmd.add_argument("target", metavar="ALIAS:PATH")
     serve_cmd = sub.add_parser("serve", help="start the local web server")
-    serve_cmd.add_argument("--port", type=int, default=0, help="port on 127.0.0.1 (default: pick a free one)")
+    serve_cmd.add_argument("--port", type=int, default=None, help="port on 127.0.0.1 (default: pick a free one)")
     serve_cmd.add_argument("--no-browser", action="store_true", help="do not open the browser")
     copy_cmd = sub.add_parser("copy", help="copy files or directories between hosts")
     copy_cmd.add_argument("paths", nargs="+", metavar="SRC... DST", help="one or more sources, then the destination")
-    copy_cmd.add_argument("--jobs", type=int, default=2, help="copies running at once (default 2)")
+    copy_cmd.add_argument("--jobs", type=int, default=None, help="copies running at once (default 2)")
     copy_cmd.add_argument("--links", action="store_true", help="copy symlinks as links (directories only)")
     copy_cmd.add_argument(
         "--on-conflict", choices=["refuse", "skip", "rename", "overwrite"], default=None,
@@ -296,17 +304,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv=None) -> int:
+def parse_args(argv=None):
+    """Parse the command line. `hopsync` alone (or with only global options) means `serve`."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command is None:
+        arguments = sys.argv[1:] if argv is None else list(argv)
+        args = parser.parse_args([*arguments, "serve"])
+    return parser, args
+
+
+async def run_settings(args) -> int:
+    path = settings_path()
+    print(f"settings file: {path}")
+    if create_template(path):
+        print("It did not exist, so a commented template was created there. Edit it to change settings.")
+    else:
+        print("It already exists; it was not changed.")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser, args = parse_args(argv)
     if args.command == "copy" and len(args.paths) < 2:
         parser.error("copy needs at least one source and a destination")
-    if args.command == "copy" and args.jobs < 1:
+    if args.command == "copy" and args.jobs is not None and args.jobs < 1:
         parser.error("--jobs must be at least 1")
     if args.command == "copy" and args.overwrite and args.on_conflict not in (None, "overwrite"):
         parser.error("--overwrite cannot be combined with --on-conflict " + args.on_conflict)
-    runner = {"list": run_list, "copy": run_copy, "serve": run_serve}[args.command]
+    runner = {"list": run_list, "copy": run_copy, "serve": run_serve, "settings": run_settings}[args.command]
     try:
+        if args.command != "settings":
+            settings = load_settings()
+            print_warnings(settings.warnings)
+            apply_settings(args, settings)
         return asyncio.run(runner(args)) or 0
     except KeyboardInterrupt:
         print("\npartial files kept; run the same command again to resume", file=sys.stderr)

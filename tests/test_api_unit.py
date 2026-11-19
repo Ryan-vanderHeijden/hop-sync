@@ -380,7 +380,7 @@ def test_there_is_no_option_to_change_the_host():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["serve", "--host", "0.0.0.0"])
     args = build_parser().parse_args(["serve", "--no-browser"])
-    assert args.port == 0 and args.no_browser
+    assert args.port is None and args.no_browser  # None: settings.toml or a free port
 
 
 def test_pick_free_port():
