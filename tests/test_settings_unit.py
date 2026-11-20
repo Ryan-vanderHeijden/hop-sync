@@ -106,7 +106,9 @@ def test_command_line_overrides_and_merges():
     settings = parse_settings({"ssh_config": "/file/config", "jobs": 4, "port": 9000, "password_for": ["a", "b"], "hosts": ["a"]})
     args = args_with()
     apply_settings(args, settings)
-    assert (args.config, args.jobs, args.port, args.password_for, args.hosts) == ("/file/config", 4, 9000, ["a", "b"], ["a"])
+    # Compare as Paths: on Windows the local path comes back with backslashes.
+    assert Path(args.config) == Path("/file/config")
+    assert (args.jobs, args.port, args.password_for, args.hosts) == (4, 9000, ["a", "b"], ["a"])
 
     args = args_with(config="/cli/config", jobs=1, port=1234, password_for=["b", "c"])
     apply_settings(args, settings)
