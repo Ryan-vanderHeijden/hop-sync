@@ -76,6 +76,7 @@ class _State:
     bytes_done: int = 0
     walk_complete: bool = False
     marker: dict = field(default_factory=dict)  # see resume.make_marker
+    marked: bool = False  # the top directory holds our marker: everything below is ours
 
     def emit_progress(self) -> None:
         self.on_event(
@@ -130,11 +131,14 @@ async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> boo
     Returns True if this call created the directory."""
     # Directories that already existed are left exactly as found: we only
     # set mode/mtime on directories we created (or when the policy is "overwrite").
-    # `created_dirs` remembers directories made earlier by the SAME job (an
-    # automatic or manual retry), so they still count as ours. Trade-off: after
-    # an interrupted run of the command line tool, a rerun is a new job, so
-    # directories made by the first run count as "existing" and keep their
-    # default mode/mtime unless the rerun uses --on-conflict overwrite.
+    # Directories count as ours (they get the source's metadata) when:
+    #  - this call made them, or an earlier attempt of the SAME job did
+    #    (`created_dirs`), or
+    #  - the whole tree is "marked": its top directory holds this source's
+    #    .hopsync-incomplete.json, which proves an earlier run of hopsync made
+    #    the top directory and so everything inside it. This is what makes a
+    #    rerun of an interrupted command line copy finish with the right
+    #    modes and times.
     attrs = await stat_or_none(state.dst.sftp, dst_dir)
     restore_mode = None
     created_now = attrs is None
@@ -145,7 +149,7 @@ async def _ensure_dir(state: _State, dst_dir: str, mode: int, mtime: int) -> boo
     elif not stat.S_ISDIR(attrs.permissions or 0):
         raise TransferError(f"'{dst_dir}' exists and is not a directory")
     else:
-        created = dst_dir in state.created_dirs
+        created = dst_dir in state.created_dirs or state.marked
         if (attrs.permissions & 0o300) != 0o300:
             # Not writable by us (e.g. left at 0555). Open it up so we can add
             # files, and remember the original mode to put back at the end.
@@ -229,6 +233,7 @@ async def _read_link(state: _State, src_path: str) -> str | None:
 
 async def _walker(state: _State, src_attrs) -> None:
     """Walk the source tree depth-first, feeding the copier's queue."""
+    state.marked = await resume.read_marker(state.dst.sftp, state.dst_root) == state.marker
     created_now = await _ensure_dir(state, state.dst_root, src_attrs.permissions or 0o755, src_attrs.mtime or 0)
     if created_now:
         # Only in a directory WE created: a marker saying "unfinished copy of

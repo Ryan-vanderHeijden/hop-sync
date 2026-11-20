@@ -343,3 +343,40 @@ async def test_marker_for_a_different_source_means_normal_nesting(hosts):
         await copy_tree(src, "t17", dst, target, lambda e: None)
         assert (await run(dst.conn, "cat t17dst/t17/f")).strip() == "x"
         assert await exists_on(dst.conn, f"t17dst/{MARKER_FILE}")  # someone else's marker untouched
+
+
+DIR_LISTING = "cd {d} && find . -type d | sort | while read p; do stat -c '%n %a %Y' \"$p\"; done"
+
+
+async def test_rerun_of_an_interrupted_cli_copy_gives_directories_the_source_metadata(hosts, monkeypatch):
+    from hopsync.cli import build_parser, run_copy
+
+    async with hpc_to_server(hosts) as (src, dst):
+        await run(src.conn, "rm -rf t19 && mkdir -p t19/sub/deep")
+        for n in range(4):
+            await run(src.conn, f"head -c 10000000 /dev/urandom > t19/f{n}.bin")
+        await run(src.conn, """
+            echo one > t19/sub/a.txt && echo two > t19/sub/deep/b.txt &&
+            chmod g-s t19 t19/sub t19/sub/deep && chmod 750 t19/sub && chmod 700 t19/sub/deep &&
+            touch -d '2017-03-04 05:06:07' t19/sub/deep && touch -d '2016-02-03 04:05:06' t19/sub &&
+            touch -d '2015-01-02 03:04:05' t19
+        """)
+        await run(dst.conn, "rm -rf t19new")
+
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": hosts.password)
+        argv = ["--config", str(hosts.config), "--password-for", "hpc", "copy", "hpc:t19", "server:t19new"]
+        task = asyncio.create_task(run_copy(build_parser().parse_args(argv)))
+        for _ in range(500):  # interrupt during the second big file, once the folders exist
+            await asyncio.sleep(0.01)
+            if await exists_on(dst.conn, "t19new/f1.bin.hopsync-part") and await exists_on(dst.conn, "t19new/sub/deep"):
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await exists_on(dst.conn, f"t19new/{MARKER_FILE}")
+
+        # The SAME command again, without --overwrite.
+        assert await cli_copy(hosts, monkeypatch, "hpc:t19", "server:t19new") == 0
+        assert not await exists_on(dst.conn, f"t19new/{MARKER_FILE}")
+        assert not await exists_on(dst.conn, "t19new/t19")
+        assert await run(dst.conn, DIR_LISTING.format(d="t19new")) == await run(src.conn, DIR_LISTING.format(d="t19"))

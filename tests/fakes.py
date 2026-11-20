@@ -70,6 +70,7 @@ class FakeSFTP:
             existing.data = bytearray()
         if path not in self.files:
             raise asyncssh.SFTPNoSuchFile("no such file")
+        self.files[path].pos = 0  # like a real open: reading starts at the beginning
         return self.files[path]
 
     async def stat(self, path):

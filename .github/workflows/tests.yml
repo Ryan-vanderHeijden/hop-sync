@@ -1,0 +1,72 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: linux (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Create the virtual environment
+        run: uv venv -p ${{ matrix.python }}
+      - name: Install hopsync and the test tools
+        run: uv pip install -e ".[dev]"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Includes the integration tests: they start sshd containers with Docker
+      # (preinstalled on ubuntu-latest). The 1 GiB test and the wheel build
+      # are marked "slow" and left out here (see the "slow" job).
+      - name: Python tests
+        run: .venv/bin/python -m pytest
+      - name: Front end tests
+        run: node --test tests/web/format.test.mjs tests/web/ui.test.mjs
+
+  windows:
+    name: windows (python 3.13)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Create the virtual environment
+        run: uv venv -p 3.13
+      - name: Install hopsync and the test tools
+        run: uv pip install -e ".[dev]"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The Windows runner cannot run the Linux sshd containers, so only the
+      # tests that do not need Docker run here. The app itself runs on Windows,
+      # which is why this job exists.
+      - name: Python tests (no Docker)
+        run: .venv\Scripts\python.exe -m pytest -m "not integration and not slow"
+      - name: Front end tests
+        run: node --test tests/web/format.test.mjs tests/web/ui.test.mjs
+
+  slow:
+    name: slow tests (on demand)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv -p 3.13
+      - run: uv pip install -e ".[dev]"
+      # The 1 GiB transfer test and the wheel build check.
+      - name: Slow tests
+        run: .venv/bin/python -m pytest -m slow

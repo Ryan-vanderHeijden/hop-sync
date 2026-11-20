@@ -191,15 +191,3 @@ async def test_ctrl_c_cancels_jobs_and_keeps_partial_files(hosts, monkeypatch, c
     assert "cancelled" in capsys.readouterr().out
     assert (await server.conn.run("test -e k1-copy.bin.hopsync-part.json", check=False)).exit_status == 0
     assert (await server.conn.run("test -e k1-copy.bin", check=False)).exit_status != 0
-
-
-def test_keyboard_interrupt_message_and_exit_code(monkeypatch, capsys):
-    from hopsync import cli
-
-    def interrupted(coro):
-        coro.close()
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(cli.asyncio, "run", interrupted)
-    assert cli.main(["copy", "a:x", "b:y"]) == 130
-    assert "partial files kept; run the same command again to resume" in capsys.readouterr().err

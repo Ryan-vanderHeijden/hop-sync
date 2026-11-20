@@ -376,3 +376,40 @@ async def test_same_error_with_open_connection_is_per_entry():
     f.fail_exc = asyncssh.SFTPFailure("Failure")
     result = await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
     assert (result.copied, result.failed) == (1, 1)
+
+
+# ---- a marked tree: everything inside was made by an earlier hopsync run -------
+
+
+def marked_destination(source_host="hpc", source_path="/src"):
+    src, dst = make_endpoints()
+    add_file(src.sftp, "/src/sub/deep/f.txt", b"f")
+    src.sftp.dir_meta.update({"/src": [0o750, 900], "/src/sub": [0o700, 800], "/src/sub/deep": [0o710, 700]})
+    dst.sftp.dirs.update({"/dst/src", "/dst/src/sub"})  # left over from an interrupted run
+    put_marker(dst.sftp, "/dst/src", host=source_host, path=source_path)
+    return src, dst
+
+
+async def test_directories_under_a_matching_marker_get_the_source_metadata():
+    src, dst = marked_destination()
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert dst.sftp.dir_meta["/dst/src"] == [0o750, 900]  # the top directory
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o700, 800]  # existed already, still ours
+    assert dst.sftp.dir_meta["/dst/src/sub/deep"] == [0o710, 700]  # created in this run
+    assert MARKER not in dst.sftp.files
+
+
+async def test_a_marker_for_another_source_changes_nothing():
+    src, dst = marked_destination(source_path="/somewhere-else")
+    dst.sftp.dir_meta.update({"/dst/src": [0o755, 5], "/dst/src/sub": [0o755, 5]})
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert dst.sftp.dir_meta["/dst/src"] == [0o755, 5]  # existing directories left as found
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o755, 5]
+    assert dst.sftp.dir_meta["/dst/src/sub/deep"] == [0o710, 700]  # this one hopsync created
+
+
+async def test_read_only_directory_in_a_marked_tree_still_ends_with_the_source_mode():
+    src, dst = marked_destination()
+    dst.sftp.dir_meta["/dst/src/sub"] = [0o555, 5]  # not writable: opened up, then set from the source
+    await copy_tree(src, "/src", dst, "/dst/src", lambda e: None)
+    assert dst.sftp.dir_meta["/dst/src/sub"] == [0o700, 800]

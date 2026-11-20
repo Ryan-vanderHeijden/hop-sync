@@ -1,3 +1,5 @@
+[![tests](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml/badge.svg)](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml)
+
 # hop-sync
 
 hop-sync moves files and folders between two machines that cannot reach each
@@ -173,7 +175,9 @@ hopsync --password-for <hpc-alias> copy <hpc-alias>:data/a.bin <hpc-alias>:data/
   only does the missing work. Overwriting needs `--overwrite` or the
   "Overwrite" choice (or your answer in the dialog).
 - **Existing folders are left as they were.** hop-sync only sets permissions
-  and times on folders it created itself.
+  and times on folders it created itself (including, when you rerun an
+  interrupted folder copy, the folders an earlier run created: the marker
+  below tells hop-sync they are its own).
 - **A half-written file never looks complete.** Data goes to
   `<name>.hopsync-part`, with a small `<name>.hopsync-part.json` next to it
   that records which source it came from. Only after the size (and checksum,
@@ -264,6 +268,19 @@ only, `hpc`: key and password) from `tests/docker-compose.yml`, bound to
 127.0.0.1, with a generated key in `tests/.hostdata/`. Without Docker they are
 skipped. Pass the file names to `node --test` explicitly (a directory argument
 does not work on every Node version).
+
+### Continuous integration
+
+`.github/workflows/tests.yml` runs on every push and pull request:
+
+- **linux**: Python 3.11 and 3.13 on Ubuntu. Runs the whole default test run,
+  including the Docker-based integration tests, plus the front end tests.
+- **windows**: Python 3.13. Runs `pytest -m "not integration and not slow"`,
+  because the Windows runner cannot run the Linux sshd containers. Any new
+  test that needs Docker must carry the `integration` marker, and anything
+  Linux-only needs a skip marker, or this job fails.
+- **slow**: the 1 GiB transfer test and the wheel build. Not run on pushes; start
+  it by hand from the Actions tab (Run workflow).
 
 Layout:
 

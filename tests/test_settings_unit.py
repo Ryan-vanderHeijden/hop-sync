@@ -216,3 +216,15 @@ def test_version_flag(capsys):
         cli.main(["--version"])
     assert info.value.code == 0
     assert capsys.readouterr().out.startswith("hopsync 0.")
+
+
+def test_keyboard_interrupt_message_and_exit_code(monkeypatch, capsys):
+    from hopsync import cli
+
+    def interrupted(coro):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.asyncio, "run", interrupted)
+    assert cli.main(["copy", "a:x", "b:y"]) == 130
+    assert "partial files kept; run the same command again to resume" in capsys.readouterr().err
