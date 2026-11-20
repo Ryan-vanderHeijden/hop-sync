@@ -92,3 +92,17 @@ export function etaSeconds(job, bytesPerSecond) {
   if (!job.walk_complete || bytesPerSecond <= 0) return null;
   return Math.max(0, job.bytes_total - job.bytes_done) / bytesPerSecond;
 }
+
+// One short phrase for a group of skipped entries, from the server's reason text.
+export function skipPhrase(reason, count) {
+  const many = count === 1 ? "" : "s";
+  const phrases = {
+    "already copied": `${count} already copied`,
+    "exists, skipped": `${count} skipped (exist)`,
+    symlink: `${count} symlink${many} skipped`,
+    "special file": `${count} special file${many} skipped`,
+    "hopsync temp file": `${count} temp file${many} skipped`,
+    "non-UTF-8 name": `${count} odd name${many} skipped`,
+  };
+  return phrases[reason] || `${count} skipped (${reason})`;
+}

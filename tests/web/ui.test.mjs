@@ -27,7 +27,7 @@ globalThis.fetch = async (url, init) => {
 };
 
 const { Pane, DRAG_TYPE } = await import("../../hopsync/web/pane.js");
-const { JobsPanel } = await import("../../hopsync/web/jobs.js");
+const { JobsPanel, MAX_SKIPPED_LIST } = await import("../../hopsync/web/jobs.js");
 const { ConflictDialog } = await import("../../hopsync/web/conflict.js");
 const { resolveConflict } = await import("../../hopsync/web/api.js");
 
@@ -139,7 +139,7 @@ test("jobs panel shows progress, a growing total, entries and buttons", () => {
   panel.handleMessage({ type: "entry", job_id: "abc12345", kind: "skipped", path: "a", reason: "already copied" });
   panel.handleMessage({ type: "entry", job_id: "abc12345", kind: "failed", path: "b.txt", reason: "denied" });
   text = panel.body.textContent;
-  assert.ok(text.includes("1 skipped") && text.includes("1 failed"));
+  assert.ok(text.includes("1 already copied") && text.includes("1 failed"));
 
   const buttons = () => panel.body.all().filter((n) => n.tagName === "BUTTON");
   buttons().find((b) => b.textContent === "Cancel").dispatch("click");
@@ -236,4 +236,64 @@ test("jobs panel shows a 'decision waiting' badge that reopens the dialog", () =
   const badge = panel.body.all().find((n) => n.tagName === "BUTTON" && n.textContent === "1 decision waiting");
   badge.dispatch("click");
   assert.deepEqual(shown, ["abc12345"]);
+});
+
+function panelWith(jobOverrides = {}) {
+  const panel = new JobsPanel(new FakeElement("section"), { onCancel() {}, onRetry() {}, onJobFinished() {} });
+  panel.handleMessage({ type: "snapshot", jobs: [job(jobOverrides)] });
+  return panel;
+}
+
+const skip = (panel, path, reason, id = "abc12345") =>
+  panel.handleMessage({ type: "entry", job_id: id, kind: "skipped", path, reason });
+const buttonNamed = (panel, text) => panel.body.all().find((n) => n.tagName === "BUTTON" && n.textContent === text);
+
+test("skipped entries are summarised per reason", () => {
+  const panel = panelWith({ state: "done", walk_complete: true });
+  skip(panel, "a", "already copied");
+  skip(panel, "b", "already copied");
+  skip(panel, "c", "exists, skipped");
+  skip(panel, "d", "symlink");
+  skip(panel, "e", "special file");
+  const summary = panel.body.all().find((n) => n.className.includes("skipped-toggle")).textContent;
+  assert.equal(summary, "2 already copied, 1 skipped (exist), 1 symlink skipped, 1 special file skipped");
+});
+
+test("the skipped summary expands to every path with its reason", () => {
+  const panel = panelWith({ state: "done", walk_complete: true });
+  skip(panel, "/out/a.txt", "already copied");
+  skip(panel, "/out/<b>.txt", "exists, skipped");
+  assert.ok(!panel.body.textContent.includes("/out/a.txt"));
+  buttonNamed(panel, "1 already copied, 1 skipped (exist)").dispatch("click");
+  const text = panel.body.textContent;
+  assert.ok(text.includes("/out/a.txt: already copied") && text.includes("/out/<b>.txt: exists, skipped"));
+  buttonNamed(panel, "1 already copied, 1 skipped (exist)").dispatch("click"); // closes again
+  assert.ok(!panel.body.textContent.includes("/out/a.txt: already copied"));
+});
+
+test("the stored list is capped but the counts stay exact", () => {
+  const panel = panelWith({ state: "done", walk_complete: true });
+  const total = MAX_SKIPPED_LIST + 37;
+  for (let i = 0; i < total; i += 1) skip(panel, `/f/${i}`, "already copied");
+  assert.equal(panel.entries.get("abc12345").skipped.length, MAX_SKIPPED_LIST);
+  buttonNamed(panel, `${total} already copied`).dispatch("click");
+  const items = panel.body.all().filter((n) => n.tagName === "LI");
+  assert.equal(items.length, MAX_SKIPPED_LIST + 1);
+  assert.equal(items.at(-1).textContent, "and 37 more");
+});
+
+test("a single file that was already on the destination says so", () => {
+  const panel = panelWith({ state: "done", walk_complete: false, files_found: 0 });
+  skip(panel, "/data/x", "already copied");
+  assert.ok(panel.body.textContent.includes("already on destination (same size and time)"));
+  // a folder copy with one identical file does not get that single-file wording
+  const tree = panelWith({ state: "done", walk_complete: true });
+  skip(tree, "/data/x/a", "already copied");
+  assert.ok(!tree.body.textContent.includes("already on destination"));
+});
+
+test("a single file skipped because a different file exists is explained too", () => {
+  const panel = panelWith({ state: "done", walk_complete: false, files_found: 0 });
+  skip(panel, "/data/x", "exists, skipped");
+  assert.ok(panel.body.textContent.includes("a different file exists on the destination"));
 });

@@ -11,6 +11,7 @@ import {
   posixBasename,
   posixDirname,
   posixJoin,
+  skipPhrase,
   SpeedTracker,
 } from "../../hopsync/web/format.js";
 
@@ -82,4 +83,12 @@ test("etaSeconds only when the walk is complete and speed is known", () => {
   assert.equal(etaSeconds(job, 0), null);
   assert.equal(etaSeconds({ ...job, walk_complete: false }, 100), null);
   assert.equal(etaSeconds({ ...job, bytes_done: 2000 }, 100), 0);
+});
+
+test("skipPhrase", () => {
+  assert.equal(skipPhrase("already copied", 3), "3 already copied");
+  assert.equal(skipPhrase("exists, skipped", 2), "2 skipped (exist)");
+  assert.equal(skipPhrase("symlink", 1), "1 symlink skipped");
+  assert.equal(skipPhrase("symlink", 3), "3 symlinks skipped");
+  assert.equal(skipPhrase("something new", 2), "2 skipped (something new)");
 });

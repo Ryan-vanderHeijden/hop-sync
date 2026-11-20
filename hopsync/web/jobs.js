@@ -1,9 +1,11 @@
 // The progress panel: one row per job, driven by WebSocket messages.
 
 import { clear, el } from "./dom.js";
-import { etaSeconds, formatEta, formatSpeed, humanSize, SpeedTracker } from "./format.js";
+import { etaSeconds, formatEta, formatSpeed, humanSize, skipPhrase, SpeedTracker } from "./format.js";
 
 const FINAL_STATES = ["done", "failed", "cancelled"];
+// A rerun of a huge tree can skip 100k files; keep only this many paths per job.
+export const MAX_SKIPPED_LIST = 500;
 
 export class JobsPanel {
   // callbacks: { onCancel(id), onRetry(id), onJobFinished(job), onShowConflict(id), onUpdate(jobs) }
@@ -11,10 +13,11 @@ export class JobsPanel {
     this.root = root;
     this.callbacks = { onShowConflict() {}, onUpdate() {}, ...callbacks };
     this.jobs = new Map(); // id -> latest job
-    this.entries = new Map(); // id -> { skipped: number, failed: [{path, reason}] }
+    this.entries = new Map(); // id -> { skipCounts: Map(reason -> n), skipped: [{path, reason}] (capped), skippedTotal, failed: [{path, reason}] }
     this.trackers = new Map(); // id -> SpeedTracker
     this.hidden = new Set(); // finished jobs the user cleared (client-side only)
     this.expanded = new Set(); // jobs whose failed list is open
+    this.expandedSkips = new Set(); // jobs whose skipped list is open
     this.renderQueued = false;
     this.buildDom();
     // Speed and ETA change with time even when no message arrives.
@@ -87,10 +90,19 @@ export class JobsPanel {
   }
 
   applyEntry(message) {
-    if (!this.entries.has(message.job_id)) this.entries.set(message.job_id, { skipped: 0, failed: [] });
+    if (!this.entries.has(message.job_id)) {
+      this.entries.set(message.job_id, { skipCounts: new Map(), skipped: [], skippedTotal: 0, failed: [] });
+    }
     const record = this.entries.get(message.job_id);
-    if (message.kind === "skipped") record.skipped += 1;
+    if (message.kind === "skipped") this.addSkipped(record, message);
     else record.failed.push({ path: message.path, reason: message.reason });
+  }
+
+  // Counts stay exact; only the list of paths is capped.
+  addSkipped(record, message) {
+    record.skippedTotal += 1;
+    record.skipCounts.set(message.reason, (record.skipCounts.get(message.reason) || 0) + 1);
+    if (record.skipped.length < MAX_SKIPPED_LIST) record.skipped.push({ path: message.path, reason: message.reason });
   }
 
   clearFinished() {
@@ -131,8 +143,7 @@ export class JobsPanel {
       this.makeButtons(job),
     );
     row.append(top, this.makeProgress(job), this.makeDetails(job));
-    const failed = this.makeFailedList(job);
-    if (failed) row.append(failed);
+    for (const list of [this.makeSkippedList(job), this.makeFailedList(job)]) if (list) row.append(list);
     return row;
   }
 
@@ -187,9 +198,39 @@ export class JobsPanel {
     }
     if (job.message) details.append(el("span", `message ${job.state}`, job.message));
     const record = this.entries.get(job.id);
-    if (record && record.skipped) details.append(el("span", "", `${record.skipped} skipped`));
+    const identical = this.identicalMessage(job, record);
+    if (identical) details.append(el("span", "message", identical));
+    if (record && record.skippedTotal) details.append(this.makeSkippedToggle(job, record));
     if (record && record.failed.length) details.append(this.makeFailedToggle(job, record));
     return details;
+  }
+
+  // A single-file job (it never walks a tree) whose one entry was skipped.
+  identicalMessage(job, record) {
+    if (job.state !== "done" || job.walk_complete || !record || record.skippedTotal !== 1) return "";
+    if (record.skipCounts.has("already copied")) return "already on destination (same size and time)";
+    return record.skipCounts.has("exists, skipped") ? "skipped: a different file exists on the destination" : "";
+  }
+
+  makeSkippedToggle(job, record) {
+    const text = [...record.skipCounts].map(([reason, count]) => skipPhrase(reason, count)).join(", ");
+    const button = el("button", "link-button skipped-toggle", text);
+    button.addEventListener("click", () => {
+      if (this.expandedSkips.has(job.id)) this.expandedSkips.delete(job.id);
+      else this.expandedSkips.add(job.id);
+      this.scheduleRender();
+    });
+    return button;
+  }
+
+  makeSkippedList(job) {
+    const record = this.entries.get(job.id);
+    if (!record || !this.expandedSkips.has(job.id)) return null;
+    const list = el("ul", "skipped-list");
+    for (const item of record.skipped) list.append(el("li", "", `${item.path}: ${item.reason}`));
+    const hidden = record.skippedTotal - record.skipped.length;
+    if (hidden > 0) list.append(el("li", "more", `and ${hidden} more`));
+    return list;
   }
 
   makeFailedToggle(job, record) {

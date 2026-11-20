@@ -127,7 +127,10 @@ button:hover { background: var(--row-hover); }
 .job-details { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); }
 .job-details .current-file { max-width: 40em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-details .message.failed { color: var(--bad); }
+.link-button.skipped-toggle { color: var(--muted); }
 .link-button { border: none; background: none; color: var(--bad); text-decoration: underline; padding: 0; }
+.skipped-list { margin: 4px 0 0; padding-left: 20px; color: var(--muted); max-height: 10em; overflow: auto; }
+.skipped-list .more { list-style: none; font-style: italic; }
 .failed-list { margin: 4px 0 0; padding-left: 20px; color: var(--bad); max-height: 10em; overflow: auto; }
 
 /* ---- toasts ---- */
