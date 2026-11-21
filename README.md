@@ -2,13 +2,13 @@
 
 # hop-sync
 
-hop-sync moves files and folders between two machines that cannot reach each
-other, for example an HPC cluster and your home server. Your own computer sits
-in the middle: the data streams from one machine to the other through your
-computer's memory. Nothing is written to your local disk.
+hop-sync moves files and folders between two servers that cannot talk to each
+other, as long as your own computer can reach both. Your computer sits in the
+middle: the data streams from one server to the other through your computer's
+memory. Nothing is written to your local disk.
 
 ```
-   HPC  ──────►  your PC (memory only)  ──────►  home server
+   server A  ──────►  your PC (memory only)  ──────►  server B
 ```
 
 You use it from a local web page with two panes (drag a file from one pane to
@@ -55,13 +55,13 @@ hop-sync reads your normal OpenSSH config, so you never type host names twice.
    and `IdentityFile` (and `ProxyJump` if you need one). Example:
 
    ```
-   Host homeserver
-       HostName 192.168.1.20
+   Host server-a
+       HostName login.example.org
        User me
        IdentityFile ~/.ssh/id_ed25519
 
-   Host <hpc-alias>
-       HostName login.cluster.example.org
+   Host server-b
+       HostName 192.168.1.20
        User me
        IdentityFile ~/.ssh/id_ed25519
    ```
@@ -71,7 +71,7 @@ hop-sync reads your normal OpenSSH config, so you never type host names twice.
 3. Key passphrases: if you use an SSH agent (the Windows OpenSSH agent, Pageant,
    or `SSH_AUTH_SOCK` on Linux), hop-sync uses it. Without an agent, hop-sync
    asks for the passphrase when it is needed.
-4. Hosts that need a password in addition to the key (typical for HPC logins)
+4. Hosts that need a password in addition to the key (common on shared systems)
    must be named with `--password-for <alias>`, or listed under `password_for`
    in the settings file. hop-sync asks for that password once, when it starts,
    and keeps it in memory only.
@@ -89,8 +89,8 @@ It prints the path: `%APPDATA%\hopsync\settings.toml` on Windows, and
 template. Example:
 
 ```toml
-hosts = ["<hpc-alias>", "homeserver"] # what the host picker shows, in this order
-password_for = ["<hpc-alias>"]        # hosts that need a password
+hosts = ["server-a", "server-b"]      # what the host picker shows, in this order
+password_for = ["server-a"]           # hosts that need a password
 ssh_config = "C:/Users/you/.ssh/config"
 jobs = 2                              # copies running at once
 port = 0                              # 0 = pick a free port
@@ -147,9 +147,9 @@ Ctrl+C in the terminal to stop.
 ## Using the command line
 
 ```powershell
-hopsync list <hpc-alias>:~/data
-hopsync --password-for <hpc-alias> copy <hpc-alias>:data/big.tar homeserver:backups
-hopsync --password-for <hpc-alias> copy <hpc-alias>:data/a.bin <hpc-alias>:data/b.bin homeserver:backups
+hopsync list server-a:~/data
+hopsync --password-for server-a copy server-a:data/big.tar server-b:backups
+hopsync --password-for server-a copy server-a:data/a.bin server-a:data/b.bin server-b:backups
 ```
 
 - Paths are `alias:path`. `~/` or no leading slash means your home directory
@@ -212,7 +212,7 @@ hopsync --password-for <hpc-alias> copy <hpc-alias>:data/a.bin <hpc-alias>:data/
   only, and never logged, written to disk or sent to the browser.
 - A failed login is never retried: a wrong or changed password fails once, and
   hop-sync will not try that host again until you restart it. Repeated bad
-  logins can lock an HPC account.
+  logins can lock an account.
 - The program only runs fixed commands on your servers (`sha256sum` with a
   quoted path). Host key checking stays on.
 

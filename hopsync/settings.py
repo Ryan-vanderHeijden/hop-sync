@@ -29,10 +29,10 @@ TEMPLATE = """\
 # Hosts shown in the web UI's host picker, in this order. The first two are
 # the defaults for the left and right pane. Default: every Host in your ssh
 # config (patterns like "*" are skipped).
-# hosts = ["<hpc-alias>", "homeserver"]
+# hosts = ["server-a", "server-b"]
 
 # Hosts that need a password (hopsync prompts for them at startup).
-# password_for = ["<hpc-alias>"]
+# password_for = ["server-a"]
 
 # Path to your ssh config. Default: ~/.ssh/config
 # ssh_config = "C:/Users/you/.ssh/config"

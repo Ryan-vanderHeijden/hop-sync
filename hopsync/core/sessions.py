@@ -42,7 +42,7 @@ class SessionPool:
 
     def _raise_remembered_auth_error(self, alias: str) -> None:
         # A failed login is remembered and re-raised WITHOUT contacting the
-        # server: repeated failed logins can lock an HPC account.
+        # server: repeated failed logins can lock an account.
         if alias in self._auth_errors:
             raise self._auth_errors[alias]
 
