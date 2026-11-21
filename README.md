@@ -89,7 +89,7 @@ It prints the path: `%APPDATA%\hopsync\settings.toml` on Windows, and
 template. Example:
 
 ```toml
-hosts = ["<hpc-alias>", "homeserver"]      # what the host picker shows, in this order
+hosts = ["<hpc-alias>", "homeserver"] # what the host picker shows, in this order
 password_for = ["<hpc-alias>"]        # hosts that need a password
 ssh_config = "C:/Users/you/.ssh/config"
 jobs = 2                              # copies running at once
