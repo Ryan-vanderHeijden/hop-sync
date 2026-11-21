@@ -299,3 +299,18 @@ prints and never prompts. It receives plain arguments (including secrets) and
 reports through events. The CLI and the web API both consume the same events.
 The version lives in `hopsync/__init__.py` (`__version__`); `pyproject.toml`
 reads it from there.
+
+### Design notes
+
+- **Memory use.** A reader task fills a bounded queue of chunks and a writer
+  task drains it, so the slower link sets the pace. With 4 chunks of 4 MB, one
+  job holds at most 16 MB in memory, whatever the file size.
+- **SSH channels.** sshd allows a limited number of channels per connection
+  (`MaxSessions`, often 10). hop-sync opens one connection per host, shares one
+  SFTP channel between all jobs on that host, and runs at most 2 extra command
+  channels (`sha256sum`) per host at once.
+- **Connection drops.** Keepalives run every 30 seconds. A dropped connection
+  reconnects with the password held in memory; a failed login never retries.
+- **Declined: a `--tar` mode** that pipes `tar` from source to destination for
+  folders with many small files. It could not resume or show a total, and
+  tarring on the source first works just as well.
