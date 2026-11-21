@@ -1,4 +1,4 @@
-[![tests](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml/badge.svg)](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml)
+[![tests](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/Ryan-vanderHeijden/hop-sync/actions/workflows/tests.yml)
 
 # hop-sync
 
